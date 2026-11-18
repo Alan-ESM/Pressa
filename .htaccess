@@ -1,0 +1,4 @@
+Options -Indexes
+<FilesMatch "^(install\.sql|README_INSTALLATION\.txt)$">
+  Require all denied
+</FilesMatch>
