@@ -1,6 +1,6 @@
 <?php require_once __DIR__.'/bootstrap.php'; require_auth(); ?>
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?= e($page_title??APP_NAME) ?> · Pressing de la joie</title><link rel="stylesheet" href="assets/css/style.css"></head><body>
-<aside class="sidebar"><div class="brand">✦ Pressing <span>de la joie</span></div><div class="userbox"><?= e($_SESSION['user']['name']) ?><small><?= e(role()) ?></small></div><nav>
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?= e($page_title??APP_NAME) ?> · <?= e(APP_NAME) ?></title><link rel="stylesheet" href="assets/css/style.css"></head><body>
+<aside class="sidebar"><div class="brand">✦ Pressa</div><div class="userbox"><?= e($_SESSION['user']['name']) ?><small><?= e(role()) ?></small></div><nav>
 <a href="dashboard.php">▦ Tableau de bord</a>
 <a href="clients.php">♙ Clients</a>
 <a href="orders.php">▤ Commandes & dépôts</a>
