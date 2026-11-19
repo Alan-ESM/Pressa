@@ -115,3 +115,16 @@ table{min-width:640px}
 .sidebar .logout:hover,.sidebar .logout:focus-visible{background:linear-gradient(135deg,#d44562,#a82b45);color:#fff;filter:brightness(1.06);transform:translateY(-1px);outline:2px solid #ffffff95;outline-offset:2px}
 
 .courier-map{height:340px;border-radius:12px;overflow:hidden;background:#eef2f7}.courier-map-panel .panel-head{align-items:center}.courier-map-panel{margin-bottom:18px}
+
+/* Auth loading screen rendered by React before the sign-in form is revealed. */
+#authLoadingRoot{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;background:linear-gradient(130deg,#172554,#3157d5 60%,#13b8a6);color:#fff;opacity:1;transition:opacity .32s ease;pointer-events:auto}
+#authLoadingRoot.is-hidden{opacity:0;pointer-events:none}
+.auth-loading{display:grid;justify-items:center;gap:18px;font-size:15px;font-weight:700;letter-spacing:.02em}
+.auth-spinner{width:54px;height:54px;border:4px solid #ffffff55;border-top-color:#fff;border-radius:50%;animation:pressa-spin .8s linear infinite}
+@keyframes pressa-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.auth-spinner{animation-duration:2.4s}#authLoadingRoot{transition-duration:.01ms}}
+.topbar-logout-form{margin:0}
+.sidebar-logout-form{margin:auto 0 0}
+.sidebar .logout{width:100%;margin-top:0;font:inherit;cursor:pointer}
+.topbar-logout{display:inline-flex;align-items:center;justify-content:center;min-height:42px;margin:0;padding:9px 12px;border:0;border-radius:9px;background:#c43350;color:#fff;font:inherit;font-weight:800;white-space:nowrap;cursor:pointer}
+.topbar-logout:hover,.topbar-logout:focus-visible{background:#a82742;color:#fff}

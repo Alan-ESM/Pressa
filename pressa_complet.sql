@@ -338,11 +338,11 @@ CREATE TABLE communications (
   uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
   client_id INT NOT NULL,
   commande_id INT NULL,
-  canal ENUM('sms','appel','interne') NOT NULL DEFAULT 'sms',
+  canal ENUM('sms','email','appel','interne') NOT NULL DEFAULT 'sms',
   type ENUM('commande_recue','commande_prete','rappel_retrait','relance_impaye','promotion','autre')
        NOT NULL DEFAULT 'autre',
   contenu TEXT NOT NULL,
-  statut ENUM('prepare','envoye_manuellement','echec','annule') NOT NULL DEFAULT 'prepare',
+  statut ENUM('prepare','envoye','envoye_manuellement','echec','annule') NOT NULL DEFAULT 'prepare',
   date_programmee DATETIME NULL,
   date_envoi DATETIME NULL,
   cree_par INT NULL,
