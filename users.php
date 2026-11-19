@@ -14,7 +14,7 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
         $pdo=db();
         $pdo->beginTransaction();
         $pdo->prepare("INSERT INTO utilisateurs(nom,email,mot_de_passe,role) VALUES(?,?,?,?)")->execute([$name,trim($_POST['email']),password_hash($pass,PASSWORD_DEFAULT),$newRole]);
-        $userId=(int)$pdo->lastInsertId();
+        $userId=(int)db_last_insert_id($pdo,'utilisateurs');
         $employeePost=['admin'=>'gerant','receptionniste'=>'receptionniste','production'=>'laveur','livreur'=>'livreur'][$newRole];
         $pdo->prepare("INSERT INTO employes(utilisateur_id,nom,poste,actif) VALUES(?,?,?,1)")->execute([$userId,$name,$employeePost]);
         $pdo->commit();

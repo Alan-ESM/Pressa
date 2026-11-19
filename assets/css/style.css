@@ -113,3 +113,5 @@ table{min-width:640px}
 
 .sidebar .logout{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:auto;min-height:46px;padding:12px 14px;border:1px solid #ffffff44;border-radius:11px;background:linear-gradient(135deg,#bb3450,#92243b);color:#fff;font-weight:800;text-decoration:none;box-shadow:0 8px 18px #09132d30;transition:filter .16s ease,transform .16s ease}
 .sidebar .logout:hover,.sidebar .logout:focus-visible{background:linear-gradient(135deg,#d44562,#a82b45);color:#fff;filter:brightness(1.06);transform:translateY(-1px);outline:2px solid #ffffff95;outline-offset:2px}
+
+.courier-map{height:340px;border-radius:12px;overflow:hidden;background:#eef2f7}.courier-map-panel .panel-head{align-items:center}.courier-map-panel{margin-bottom:18px}

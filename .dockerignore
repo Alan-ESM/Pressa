@@ -1,0 +1,11 @@
+.git
+.work
+.env
+.env.*
+vendor
+supabase
+scripts
+archive
+pressa_complet.sql
+README_INSTALLATION.txt
+*.sql

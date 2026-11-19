@@ -1,0 +1,7 @@
+:{$PORT:80} {
+	@private path /.env* /.git* /vendor/* /supabase/* /scripts/* /archive/* /config/* /includes/* /composer.* /Dockerfile* /Caddyfile /pressa_complet.sql /README_INSTALLATION.txt
+	respond @private 404
+	root * /app
+	encode zstd gzip
+	php_server
+}

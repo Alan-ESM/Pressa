@@ -88,3 +88,49 @@ Si vous avez déjà installé une ancienne version de Pressing de la joie et que
 la base pressing_de_la_joie contient déjà les 25 tables, NE réimportez PAS
 install.sql. Faites d'abord une sauvegarde phpMyAdmin > Exporter, puis importez
 upgrade_modules.sql. Ce fichier met à jour les déclencheurs d'alerte de stock.
+
+
+ENVOI DES E-MAILS (SMTP GMAIL)
+==============================
+Le canal E-mail du menu Messages utilise PHPMailer via SMTP chiffré.
+1. Ne mettez jamais le mot de passe de connexion Gmail dans le dépôt ou dans
+   le code. Gmail SMTP demande un mot de passe d'application Google (avec la
+   validation en deux étapes activée); le mot de passe principal ne convient
+   pas. Cette configuration ne modifie aucun mot de passe existant.
+2. Installez Composer et exécutez `composer install` à la racine du projet.
+3. Définissez PRESSA_SMTP_USERNAME, PRESSA_SMTP_PASSWORD, PRESSA_SMTP_HOST
+   (smtp.gmail.com), PRESSA_SMTP_PORT (587) et PRESSA_SMTP_FROM dans
+   l'environnement serveur (Apache/Vercel). .env.example est un modèle;
+   ne mettez pas de secret dans config.php ni dans Git.
+4. Importez archive/upgrade_email.sql dans phpMyAdmin sur la base pressa
+   existante, après sauvegarde. Les nouvelles installations prennent la
+   modification dans pressa_complet.sql.
+5. Ajoutez une adresse e-mail valide à la fiche du client. Dans Messages,
+   choisissez le client, le canal E-mail et envoyez.
+
+Le secret SMTP doit être un mot de passe d'application fourni par le titulaire
+du compte et stocké uniquement dans l'environnement du serveur. Aucun mot de
+passe Gmail n'est enregistré dans les fichiers du projet.
+
+
+CONNEXION PHP À SUPABASE POSTGRESQL
+===================================
+Le dump de démonstration est copié dans le projet Supabase Pressa. Les pages
+PHP peuvent utiliser PostgreSQL en définissant côté serveur :
+  PRESSA_DB_DRIVER=pgsql
+  PRESSA_DATABASE_URL=<URL PostgreSQL Session Pooler copiée dans Supabase > Connect>
+Conservez le mot de passe PostgreSQL existant. Ne mettez jamais l’URL avec son
+secret dans Git. Le modèle .env.example ne contient aucun secret réel. Le mode
+local XAMPP reste MySQL tant que PRESSA_DB_DRIVER n’est pas défini.
+
+PUBLICATION VERCEL
+==================
+Le dépôt Vercel utilise Dockerfile.vercel et Caddyfile pour exécuter PHP avec
+FrankenPHP, PDO PostgreSQL et Composer. Les fichiers SQL, les migrations, la
+configuration privée et les secrets sont exclus de l’image ou bloqués par le
+serveur web. L’application utilise la table app_sessions de Supabase afin de
+conserver les sessions entre instances Vercel. La route /health.php vérifie
+que PHP et la connexion à PostgreSQL répondent.
+Dans les variables d’environnement Production de Vercel, configurez
+PRESSA_DB_DRIVER=pgsql et PRESSA_DATABASE_URL avec l’URL Session Pooler du
+projet Pressa, puis redéployez. Le mot de passe de la base n’est pas remplacé.
