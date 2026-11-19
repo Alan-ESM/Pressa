@@ -1,19 +1,20 @@
 <?php
 require_once __DIR__.'/includes/bootstrap.php';
-require_auth();
+require_role(['admin','receptionniste','accueil']);
 $page_title='Messages clients';
 $pdo=db();
 
 if($_SERVER['REQUEST_METHOD']==='POST'){
     verify_csrf();
     $cid=(int)($_POST['client_id']??0);
-    $msg=trim($_POST['message']??'');
+    $msg=trim((string)($_POST['message']??''));
     $channel=($_POST['channel']??'sms')==='email'?'email':'sms';
     $orderId=($_POST['order_id']??'')!==''?(int)$_POST['order_id']:null;
     $clientQuery=$pdo->prepare('SELECT id,nom,prenom,telephone,email FROM clients WHERE id=?');
     $clientQuery->execute([$cid]);
     $client=$clientQuery->fetch();
-    if(!$client||$msg===''){flash('Choisissez un client et saisissez un message.','error');redirect('messages.php');}
+    if(!$client||$msg===''||mb_strlen($msg)>10000){flash('Choisissez un client et saisissez un message de moins de 10 000 caractères.','error');redirect('messages.php');}
+    if($orderId!==null){$orderCheck=$pdo->prepare('SELECT id FROM commandes WHERE id=? AND client_id=?');$orderCheck->execute([$orderId,$cid]);if(!$orderCheck->fetchColumn()){flash('La commande sélectionnée ne correspond pas au client.','error');redirect('messages.php');}}
     if($channel==='email'&&filter_var($client['email'],FILTER_VALIDATE_EMAIL)===false){flash('Ce client n’a pas d’adresse e-mail valide.','error');redirect('messages.php');}
     try{
         $pdo->beginTransaction();
@@ -26,6 +27,7 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
             $pdo->prepare("UPDATE communications SET statut='envoye',date_envoi=NOW() WHERE id=?")->execute([$messageId]);
         }
         $pdo->commit();
+        audit_event('SEND_MESSAGE','communications',$messageId);
         flash($channel==='email'?'E-mail envoyé au client.':'Message enregistré dans l’historique. Cliquez sur « Ouvrir les SMS » pour l’envoyer depuis votre téléphone.');
     }catch(Throwable $e){
         if($pdo->inTransaction())$pdo->rollBack();
@@ -34,7 +36,7 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
     }
     redirect('messages.php');
 }
-$clients=$pdo->query('SELECT id,nom,prenom,telephone,email FROM clients ORDER BY nom')->fetchAll();
+$clients=$pdo->query('SELECT id,nom,prenom,telephone,email FROM clients WHERE supprime=0 ORDER BY nom LIMIT 500')->fetchAll();
 $msgs=$pdo->query("SELECT m.*,m.contenu AS message,m.cree_le AS created_at,c.nom,c.prenom,c.telephone,c.email,o.reference AS code FROM communications m JOIN clients c ON c.id=m.client_id LEFT JOIN commandes o ON o.id=m.commande_id ORDER BY m.id DESC LIMIT 50")->fetchAll();
 require 'includes/header.php';
 ?>

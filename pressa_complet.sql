@@ -1,641 +1,339 @@
--- =====================================================================
---  PRESSA - Base de données complète pour pressing
---  MySQL 8 / MariaDB 10.4+ (XAMPP) - InnoDB - utf8mb4 - devise FCFA
+-- phpMyAdmin SQL Dump
+-- version 5.2.3
+-- https://www.phpmyadmin.net/
 --
---  Ce script couvre : clients, dépôts et tarifs, paiements et caisse,
---  remboursements, retraits, livraisons, réclamations, communications
---  (SMS préparés), stock et alertes, fournisseurs et achats,
---  équipements et maintenance, dépenses, salaires et présences,
---  utilisateurs et rôles, journal d'audit infalsifiable, et tables de
---  synchronisation pour un fonctionnement hors ligne.
+-- Host: 127.0.0.1
+-- Generation Time: Nov 19, 2026 at 10:16 PM
+-- Server version: 10.11.16-MariaDB
+-- PHP Version: 8.3.36
+
+SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
+START TRANSACTION;
+SET time_zone = "+00:00";
+
+
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
+/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
+/*!40101 SET NAMES utf8mb4 */;
+
 --
---  Principes :
---   - Les règles de gestion critiques sont appliquées par la base
---     (triggers, contraintes, procédures), pas seulement par l'appareil.
---   - Les prix sont copiés à la commande ; les totaux sont recalculés
---     automatiquement.
---   - Les paiements et mouvements de stock ne sont jamais modifiés ni
---     supprimés (on corrige par remboursement ou contre-écriture).
---   - Chaque enregistrement possède un UUID : indispensable pour la
---     synchronisation sans doublon.
+-- Database: `pressa`
 --
---  AVANT D'EXÉCUTER : pour une réinstallation complète, supprimez d'abord
---  l'ancienne base (DROP DATABASE pressa;). L'application doit
---  renseigner la variable @app_user_id à chaque connexion (voir README).
--- =====================================================================
 
-CREATE DATABASE IF NOT EXISTS pressa CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE pressa;
-SET NAMES utf8mb4;
-SET FOREIGN_KEY_CHECKS = 1;
-
--- ---------------------------------------------------------------------
--- 1. PARAMÈTRES DU PRESSING (une seule source de vérité)
--- ---------------------------------------------------------------------
-CREATE TABLE parametres (
-  cle VARCHAR(60) NOT NULL PRIMARY KEY,
-  valeur VARCHAR(255) NOT NULL,
-  description VARCHAR(255) NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 2. UTILISATEURS (comptes de connexion)
--- ---------------------------------------------------------------------
-CREATE TABLE utilisateurs (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  nom VARCHAR(120) NOT NULL,
-  email VARCHAR(160) NOT NULL UNIQUE,
-  mot_de_passe VARCHAR(255) NOT NULL,              -- haché avec password_hash() côté PHP
-  role ENUM('admin','caissier','accueil','production','livreur') NOT NULL DEFAULT 'accueil',
-  actif TINYINT(1) NOT NULL DEFAULT 1,
-  tentatives_echec INT NOT NULL DEFAULT 0,         -- anti force brute
-  verrouille_jusqu_a DATETIME NULL,
-  derniere_connexion DATETIME NULL,
-  cree_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  modifie_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 3. EMPLOYÉS ET POSTES (une personne peut ne pas avoir de compte)
--- ---------------------------------------------------------------------
-CREATE TABLE employes (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  utilisateur_id INT NULL UNIQUE,
-  nom VARCHAR(120) NOT NULL,
-  prenom VARCHAR(120) NULL,
-  telephone VARCHAR(30) NULL,
-  poste ENUM('gerant','caissier','accueil','laveur','repasseur','detacheur',
-             'emballeur','livreur','comptable','autre') NOT NULL,
-  date_embauche DATE NULL,
-  salaire_mensuel DECIMAL(12,2) NOT NULL DEFAULT 0,
-  actif TINYINT(1) NOT NULL DEFAULT 1,
-  notes TEXT NULL,
-  FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id),
-  CHECK (salaire_mensuel >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE presences (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  employe_id INT NOT NULL,
-  date_presence DATE NOT NULL,
-  creneau ENUM('matin','apres_midi','journee') NOT NULL DEFAULT 'journee',
-  statut ENUM('present','absent','retard','conge','repos') NOT NULL,
-  UNIQUE KEY uq_presence (employe_id, date_presence),
-  FOREIGN KEY (employe_id) REFERENCES employes(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE salaires (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  employe_id INT NOT NULL,
-  periode CHAR(7) NOT NULL,                        -- format AAAA-MM
-  montant DECIMAL(12,2) NOT NULL,
-  date_paiement DATE NOT NULL,
-  mode_paiement ENUM('especes','mtn_momo','orange_money','virement') NOT NULL DEFAULT 'especes',
-  session_id INT NULL,                             -- clé ajoutée après la table sessions_caisse
-  enregistre_par INT NULL,
-  FOREIGN KEY (employe_id) REFERENCES employes(id),
-  FOREIGN KEY (enregistre_par) REFERENCES utilisateurs(id),
-  CHECK (montant > 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 4. CLIENTS (avec consentement pour les messages)
--- ---------------------------------------------------------------------
-CREATE TABLE clients (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  nom VARCHAR(120) NOT NULL,
-  prenom VARCHAR(120) NULL,
-  type_client ENUM('particulier','entreprise') NOT NULL DEFAULT 'particulier',
-  telephone VARCHAR(30) NOT NULL,
-  telephone_secondaire VARCHAR(30) NULL,
-  email VARCHAR(160) NULL,
-  adresse VARCHAR(255) NULL,
-  quartier VARCHAR(120) NULL,
-  canal_prefere ENUM('sms','appel','aucun') NOT NULL DEFAULT 'sms',
-  accepte_sms TINYINT(1) NOT NULL DEFAULT 0,       -- 0 par défaut : consentement explicite
-  accepte_promotions TINYINT(1) NOT NULL DEFAULT 0,
-  date_consentement DATETIME NULL,
-  notes TEXT NULL,
-  supprime TINYINT(1) NOT NULL DEFAULT 0,          -- suppression logique
-  version INT NOT NULL DEFAULT 1,                  -- contrôle de concurrence (synchro)
-  cree_par INT NULL,
-  cree_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  modifie_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_client_tel (telephone),
-  INDEX idx_client_nom (nom, prenom),
-  FOREIGN KEY (cree_par) REFERENCES utilisateurs(id),
-  CHECK (accepte_sms IN (0,1)),
-  CHECK (accepte_promotions IN (0,1))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 5. SERVICES, TYPES D'ARTICLES ET TARIFS HISTORISÉS
--- ---------------------------------------------------------------------
-CREATE TABLE services (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  code VARCHAR(20) NOT NULL UNIQUE,
-  nom VARCHAR(100) NOT NULL,
-  description VARCHAR(255) NULL,
-  delai_jours INT NOT NULL DEFAULT 2,
-  actif TINYINT(1) NOT NULL DEFAULT 1,
-  CHECK (delai_jours >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE types_articles (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  nom VARCHAR(100) NOT NULL UNIQUE,
-  unite ENUM('piece','ensemble','kg') NOT NULL DEFAULT 'piece',
-  actif TINYINT(1) NOT NULL DEFAULT 1
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Un tarif = un service appliqué à un type d'article, à partir d'une date.
--- On ne modifie jamais un tarif : on en crée un nouveau avec une nouvelle date.
-CREATE TABLE tarifs (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  service_id INT NOT NULL,
-  type_article_id INT NOT NULL,
-  prix DECIMAL(12,2) NOT NULL,
-  cout_estime DECIMAL(12,2) NOT NULL DEFAULT 0,
-  date_effet DATE NOT NULL,
-  UNIQUE KEY uq_tarif (service_id, type_article_id, date_effet),
-  FOREIGN KEY (service_id) REFERENCES services(id),
-  FOREIGN KEY (type_article_id) REFERENCES types_articles(id),
-  CHECK (prix >= 0),
-  CHECK (cout_estime >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 6. COMMANDES (dépôts) ET LIGNES
--- ---------------------------------------------------------------------
-CREATE TABLE commandes (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  reference VARCHAR(30) NOT NULL UNIQUE,           -- ex. PR-261118-A3F9
-  client_id INT NOT NULL,
-  depose_par INT NULL,
-  type_depot ENUM('normal','express') NOT NULL DEFAULT 'normal',
-  mode_remise ENUM('retrait','livraison') NOT NULL DEFAULT 'retrait',
-  statut ENUM('recu','lavage','repassage','emballage','pret','retire','annule')
-         NOT NULL DEFAULT 'recu',
-  date_depot DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  date_promise DATE NOT NULL,
-  date_pret DATETIME NULL,
-  date_retrait DATETIME NULL,
-  emplacement VARCHAR(30) NULL,                    -- rayon / étagère
-  sous_total DECIMAL(12,2) NOT NULL DEFAULT 0,     -- calculé automatiquement
-  remise_montant DECIMAL(12,2) NOT NULL DEFAULT 0,
-  motif_remise VARCHAR(255) NULL,
-  surcharge_express DECIMAL(12,2) NOT NULL DEFAULT 0, -- calculé automatiquement
-  total DECIMAL(12,2) NOT NULL DEFAULT 0,          -- calculé automatiquement
-  notes TEXT NULL,
-  motif_annulation VARCHAR(255) NULL,
-  version INT NOT NULL DEFAULT 1,
-  cree_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  modifie_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_cmd_statut (statut),
-  INDEX idx_cmd_date (date_depot),
-  FOREIGN KEY (client_id) REFERENCES clients(id),
-  FOREIGN KEY (depose_par) REFERENCES utilisateurs(id),
-  CHECK (remise_montant >= 0),
-  CHECK (total >= 0),
-  CHECK (statut <> 'annule' OR motif_annulation IS NOT NULL)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE commande_lignes (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  commande_id INT NOT NULL,
-  tarif_id INT NOT NULL,
-  description VARCHAR(160) NOT NULL,               -- ex. « Chemise blanche Mme Kamga »
-  quantite INT NOT NULL DEFAULT 1,
-  prix_unitaire DECIMAL(12,2) NOT NULL DEFAULT 0,  -- copié du tarif par trigger
-  cout_unitaire DECIMAL(12,2) NOT NULL DEFAULT 0,  -- copié du tarif par trigger
-  remise_pct DECIMAL(5,2) NOT NULL DEFAULT 0,
-  sous_total DECIMAL(12,2) AS (ROUND(quantite * prix_unitaire * (1 - remise_pct/100), 0)) STORED,
-  FOREIGN KEY (commande_id) REFERENCES commandes(id),
-  FOREIGN KEY (tarif_id) REFERENCES tarifs(id),
-  CHECK (quantite > 0),
-  CHECK (remise_pct BETWEEN 0 AND 100)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE historique_statuts (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  commande_id INT NOT NULL,
-  ancien_statut VARCHAR(20) NULL,
-  nouveau_statut VARCHAR(20) NOT NULL,
-  utilisateur_id INT NULL,
-  date_changement DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  FOREIGN KEY (commande_id) REFERENCES commandes(id),
-  FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 7. CAISSE : sessions, paiements, remboursements
--- ---------------------------------------------------------------------
-CREATE TABLE sessions_caisse (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  utilisateur_id INT NOT NULL,
-  date_ouverture DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  fond_ouverture DECIMAL(12,2) NOT NULL DEFAULT 0,
-  date_fermeture DATETIME NULL,
-  total_theorique DECIMAL(12,2) NOT NULL DEFAULT 0,  -- espèces nettes (encaissées - sorties)
-  total_compte DECIMAL(12,2) NULL,                   -- espèces comptées
-  ecart DECIMAL(12,2) AS (total_compte - (fond_ouverture + total_theorique)) STORED, -- compté - attendu
-  commentaire_ecart TEXT NULL,
-  valide_par INT NULL,
-  date_validation DATETIME NULL,
-  FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id),
-  FOREIGN KEY (valide_par) REFERENCES utilisateurs(id),
-  CHECK (fond_ouverture >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-ALTER TABLE salaires ADD CONSTRAINT fk_salaire_session FOREIGN KEY (session_id) REFERENCES sessions_caisse(id);
-
-CREATE TABLE paiements (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),  -- évite les doublons en synchro
-  commande_id INT NOT NULL,
-  session_id INT NULL,
-  montant DECIMAL(12,2) NOT NULL,
-  mode ENUM('especes','mtn_momo','orange_money','virement','carte','cheque') NOT NULL,
-  reference VARCHAR(100) NULL,                     -- ID de transaction Mobile Money
-  enregistre_par INT NULL,
-  date_paiement DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  INDEX idx_paie_commande (commande_id),
-  FOREIGN KEY (commande_id) REFERENCES commandes(id),
-  FOREIGN KEY (session_id) REFERENCES sessions_caisse(id),
-  FOREIGN KEY (enregistre_par) REFERENCES utilisateurs(id),
-  CHECK (montant > 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE remboursements (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  commande_id INT NOT NULL,
-  session_id INT NULL,
-  montant DECIMAL(12,2) NOT NULL,
-  mode ENUM('especes','mtn_momo','orange_money','virement','carte','cheque') NOT NULL DEFAULT 'especes',
-  motif VARCHAR(255) NOT NULL,
-  enregistre_par INT NULL,
-  date_remboursement DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  FOREIGN KEY (commande_id) REFERENCES commandes(id),
-  FOREIGN KEY (session_id) REFERENCES sessions_caisse(id),
-  FOREIGN KEY (enregistre_par) REFERENCES utilisateurs(id),
-  CHECK (montant > 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 8. LIVRAISONS / COLLECTES, RÉCLAMATIONS, COMMUNICATIONS
--- ---------------------------------------------------------------------
-CREATE TABLE courses (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  commande_id INT NOT NULL,
-  type ENUM('collecte','livraison') NOT NULL,
-  date_prevue DATE NOT NULL,
-  creneau ENUM('matin','apres_midi','soir') NOT NULL DEFAULT 'matin',
-  adresse VARCHAR(255) NULL,
-  statut ENUM('planifiee','en_cours','effectuee','annulee') NOT NULL DEFAULT 'planifiee',
-  frais DECIMAL(12,2) NOT NULL DEFAULT 0,
-  livreur_id INT NULL,
-  date_realisation DATETIME NULL,
-  notes VARCHAR(255) NULL,
-  FOREIGN KEY (commande_id) REFERENCES commandes(id),
-  FOREIGN KEY (livreur_id) REFERENCES employes(id),
-  CHECK (frais >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE reclamations (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  client_id INT NOT NULL,
-  commande_id INT NULL,
-  date_reclamation DATE NOT NULL,
-  nature VARCHAR(120) NOT NULL,
-  demande TEXT NULL,
-  decision TEXT NULL,
-  statut ENUM('ouverte','en_cours','cloturee') NOT NULL DEFAULT 'ouverte',
-  traite_par INT NULL,
-  date_info_client DATE NULL,
-  date_cloture DATETIME NULL,
-  FOREIGN KEY (client_id) REFERENCES clients(id),
-  FOREIGN KEY (commande_id) REFERENCES commandes(id),
-  FOREIGN KEY (traite_par) REFERENCES utilisateurs(id),
-  CHECK (statut <> 'cloturee' OR decision IS NOT NULL)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Messages : seulement SMS, appel ou interne (pas de WhatsApp).
-CREATE TABLE communications (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  client_id INT NOT NULL,
-  commande_id INT NULL,
-  canal ENUM('sms','email','appel','interne') NOT NULL DEFAULT 'sms',
-  type ENUM('commande_recue','commande_prete','rappel_retrait','relance_impaye','promotion','autre')
-       NOT NULL DEFAULT 'autre',
-  contenu TEXT NOT NULL,
-  statut ENUM('prepare','envoye','envoye_manuellement','echec','annule') NOT NULL DEFAULT 'prepare',
-  date_programmee DATETIME NULL,
-  date_envoi DATETIME NULL,
-  cree_par INT NULL,
-  cree_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (client_id) REFERENCES clients(id),
-  FOREIGN KEY (commande_id) REFERENCES commandes(id),
-  FOREIGN KEY (cree_par) REFERENCES utilisateurs(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 9. STOCK : produits, mouvements, alertes
--- ---------------------------------------------------------------------
-CREATE TABLE produits_stock (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  reference VARCHAR(30) NULL UNIQUE,
-  libelle VARCHAR(150) NOT NULL,
-  categorie ENUM('consommable','emballage','outillage','autre') NOT NULL DEFAULT 'consommable',
-  unite ENUM('kg','litre','paquet','piece','bidon') NOT NULL DEFAULT 'piece',
-  quantite_stock DECIMAL(12,3) NOT NULL DEFAULT 0,  -- mis à jour par trigger uniquement
-  seuil_min DECIMAL(12,3) NOT NULL DEFAULT 0,
-  cout_moyen DECIMAL(12,2) NOT NULL DEFAULT 0,      -- coût moyen pondéré (trigger)
-  actif TINYINT(1) NOT NULL DEFAULT 1,
-  version INT NOT NULL DEFAULT 1,
-  CHECK (quantite_stock >= 0),
-  CHECK (seuil_min >= 0),
-  CHECK (cout_moyen >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Un mouvement n'est jamais modifié ni supprimé. Les quantités avant/après
--- et le coût moyen sont calculés par trigger, pas par l'application.
-CREATE TABLE mouvements_stock (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  produit_id INT NOT NULL,
-  type ENUM('entree','sortie','ajustement') NOT NULL,
-  quantite DECIMAL(12,3) NOT NULL,                 -- pour un ajustement : stock réel compté
-  prix_unitaire DECIMAL(12,2) NULL,                -- uniquement pour une entrée d'achat
-  quantite_avant DECIMAL(12,3) NOT NULL DEFAULT 0,
-  quantite_apres DECIMAL(12,3) NOT NULL DEFAULT 0,
-  cout_moyen_apres DECIMAL(12,2) NOT NULL DEFAULT 0,
-  motif VARCHAR(255) NULL,
-  reference_document VARCHAR(50) NULL,
-  utilisateur_id INT NULL,
-  date_mouvement DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  FOREIGN KEY (produit_id) REFERENCES produits_stock(id),
-  FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id),
-  CHECK (quantite >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE alertes_stock (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  produit_id INT NOT NULL,
-  date_alerte DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  etat ENUM('ouverte','traitee') NOT NULL DEFAULT 'ouverte',
-  traitee_par INT NULL,
-  date_traitement DATETIME NULL,
-  FOREIGN KEY (produit_id) REFERENCES produits_stock(id),
-  FOREIGN KEY (traitee_par) REFERENCES utilisateurs(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 10. FOURNISSEURS, ACHATS, RÈGLEMENTS
--- ---------------------------------------------------------------------
-CREATE TABLE fournisseurs (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  nom VARCHAR(150) NOT NULL,
-  telephone VARCHAR(30) NULL,
-  email VARCHAR(160) NULL,
-  adresse VARCHAR(255) NULL,
-  actif TINYINT(1) NOT NULL DEFAULT 1,
-  notes TEXT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE bons_achat (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  reference VARCHAR(30) NOT NULL UNIQUE,
-  fournisseur_id INT NOT NULL,
-  date_bon DATE NOT NULL,
-  statut ENUM('brouillon','envoye','recu_partiel','recu','annule') NOT NULL DEFAULT 'brouillon',
-  date_reception DATE NULL,
-  cree_par INT NULL,
-  notes VARCHAR(255) NULL,
-  FOREIGN KEY (fournisseur_id) REFERENCES fournisseurs(id),
-  FOREIGN KEY (cree_par) REFERENCES utilisateurs(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE bons_achat_lignes (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  bon_id INT NOT NULL,
-  produit_id INT NOT NULL,
-  quantite_commandee DECIMAL(12,3) NOT NULL,
-  quantite_recue DECIMAL(12,3) NOT NULL DEFAULT 0,
-  prix_unitaire DECIMAL(12,2) NOT NULL,
-  FOREIGN KEY (bon_id) REFERENCES bons_achat(id),
-  FOREIGN KEY (produit_id) REFERENCES produits_stock(id),
-  CHECK (quantite_commandee > 0),
-  CHECK (quantite_recue >= 0),
-  CHECK (quantite_recue <= quantite_commandee),
-  CHECK (prix_unitaire >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE reglements_fournisseurs (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  fournisseur_id INT NOT NULL,
-  bon_id INT NULL,
-  session_id INT NULL,
-  montant DECIMAL(12,2) NOT NULL,
-  mode ENUM('especes','mtn_momo','orange_money','virement','cheque') NOT NULL DEFAULT 'virement',
-  reference VARCHAR(100) NULL,
-  enregistre_par INT NULL,
-  date_reglement DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  FOREIGN KEY (fournisseur_id) REFERENCES fournisseurs(id),
-  FOREIGN KEY (bon_id) REFERENCES bons_achat(id),
-  FOREIGN KEY (session_id) REFERENCES sessions_caisse(id),
-  FOREIGN KEY (enregistre_par) REFERENCES utilisateurs(id),
-  CHECK (montant > 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 11. ÉQUIPEMENTS ET MAINTENANCE
--- ---------------------------------------------------------------------
-CREATE TABLE equipements (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  designation VARCHAR(150) NOT NULL,
-  numero_serie VARCHAR(100) NULL,
-  categorie ENUM('machine_laver','presse','secheuse','table_repassage','generateur','autre')
-            NOT NULL DEFAULT 'autre',
-  date_acquisition DATE NULL,
-  valeur_acquisition DECIMAL(12,2) NOT NULL DEFAULT 0,
-  fournisseur_id INT NULL,
-  etat ENUM('en_service','en_panne','hors_service') NOT NULL DEFAULT 'en_service',
-  actif TINYINT(1) NOT NULL DEFAULT 1,
-  FOREIGN KEY (fournisseur_id) REFERENCES fournisseurs(id),
-  CHECK (valeur_acquisition >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE interventions (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  equipement_id INT NOT NULL,
-  date_intervention DATE NOT NULL,
-  type ENUM('preventive','corrective','nettoyage','autre') NOT NULL DEFAULT 'corrective',
-  description TEXT NULL,
-  technicien VARCHAR(120) NULL,
-  duree_arret_min INT NOT NULL DEFAULT 0,          -- durée d'arrêt en MINUTES
-  cout DECIMAL(12,2) NOT NULL DEFAULT 0,
-  FOREIGN KEY (equipement_id) REFERENCES equipements(id),
-  CHECK (duree_arret_min >= 0),
-  CHECK (cout >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 12. DÉPENSES
--- ---------------------------------------------------------------------
-CREATE TABLE depenses (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  date_depense DATE NOT NULL,
-  categorie ENUM('loyer','electricite_eau','produits_lavage','transport','maintenance',
-                 'internet_telephone','impots_taxes','fournitures','publicite','autre') NOT NULL,
-  libelle VARCHAR(160) NULL,
-  montant DECIMAL(12,2) NOT NULL,
-  mode_paiement ENUM('especes','mtn_momo','orange_money','virement','carte','cheque')
-                NOT NULL DEFAULT 'especes',
-  justificatif VARCHAR(100) NULL,                  -- numéro de reçu ou de facture
-  commentaire TEXT NULL,
-  fournisseur_id INT NULL,
-  intervention_id INT NULL,
-  session_id INT NULL,
-  enregistre_par INT NULL,
-  cree_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (fournisseur_id) REFERENCES fournisseurs(id),
-  FOREIGN KEY (intervention_id) REFERENCES interventions(id),
-  FOREIGN KEY (session_id) REFERENCES sessions_caisse(id),
-  FOREIGN KEY (enregistre_par) REFERENCES utilisateurs(id),
-  CHECK (montant > 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ---------------------------------------------------------------------
--- 13. JOURNAL D'AUDIT (infalsifiable) ET SYNCHRONISATION HORS LIGNE
--- ---------------------------------------------------------------------
-CREATE TABLE journal_audit (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  date_heure DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  utilisateur_id INT NULL,
-  action VARCHAR(60) NOT NULL,
-  table_cible VARCHAR(60) NOT NULL,
-  enregistrement_id INT NULL,
-  ancienne_valeur TEXT NULL,
-  nouvelle_valeur TEXT NULL,
-  appareil_uuid CHAR(36) NULL,
-  FOREIGN KEY (utilisateur_id) REFERENCES utilisateurs(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE appareils (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE DEFAULT (UUID()),
-  nom VARCHAR(100) NOT NULL,
-  type ENUM('caisse','tablette','telephone','serveur') NOT NULL DEFAULT 'caisse',
-  actif TINYINT(1) NOT NULL DEFAULT 1,
-  derniere_synchro DATETIME NULL,
-  cree_le DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- File d'attente des opérations faites hors ligne sur un appareil.
--- Le serveur les applique une seule fois (idempotence par uuid).
-CREATE TABLE file_synchro (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  uuid CHAR(36) NOT NULL UNIQUE,                   -- généré sur l'appareil
-  appareil_uuid CHAR(36) NOT NULL,
-  table_cible VARCHAR(60) NOT NULL,
-  enregistrement_uuid CHAR(36) NOT NULL,
-  operation ENUM('insert','update','delete') NOT NULL,
-  contenu JSON NOT NULL,
-  date_locale DATETIME(6) NOT NULL,                -- heure sur l'appareil au moment de l'action
-  recu_le DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-  statut ENUM('en_attente','appliquee','conflit','rejetee') NOT NULL DEFAULT 'en_attente',
-  message_erreur TEXT NULL,
-  traitee_le DATETIME NULL,
-  INDEX idx_sync_statut (statut)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-
--- =====================================================================
---  TRIGGERS : règles de gestion appliquées par la base
--- =====================================================================
 DELIMITER $$
+--
+-- Procedures
+--
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_cloturer_caisse` (IN `p_session_id` INT, IN `p_total_compte` DECIMAL(12,2), IN `p_commentaire` TEXT, IN `p_utilisateur_id` INT)   BEGIN
+  DECLARE v_fermee DATETIME;
+  SELECT date_fermeture INTO v_fermee FROM sessions_caisse WHERE id = p_session_id FOR UPDATE;
+  IF v_fermee IS NOT NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Cette caisse est déjà clôturée';
+  END IF;
+  UPDATE sessions_caisse
+     SET total_compte = p_total_compte,
+         commentaire_ecart = p_commentaire,
+         date_fermeture = NOW(),
+         valide_par = p_utilisateur_id,
+         date_validation = NOW()
+   WHERE id = p_session_id;
+  -- Les espèces encaissées sont rattachées à la session par trigger ci-dessus.
+END$$
 
--- ---- 13.1 Commandes : copie du prix et du coût à partir du tarif ----
-CREATE TRIGGER trg_lignes_avant_insert BEFORE INSERT ON commande_lignes
-FOR EACH ROW
-BEGIN
-  DECLARE v_prix DECIMAL(12,2);
-  DECLARE v_cout DECIMAL(12,2);
-  DECLARE v_nom VARCHAR(100);
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_enregistrer_paiement` (IN `p_commande_id` INT, IN `p_montant` DECIMAL(12,2), IN `p_mode` VARCHAR(20), IN `p_reference` VARCHAR(100), IN `p_utilisateur_id` INT, IN `p_session_id` INT)   BEGIN
+  DECLARE v_total DECIMAL(12,2);
   DECLARE v_statut VARCHAR(20);
+  DECLARE v_solde DECIMAL(12,2);
 
-  SELECT statut INTO v_statut FROM commandes WHERE id = NEW.commande_id;
-  IF v_statut IN ('retire','annule') THEN
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Commande clôturée : ajout de ligne impossible';
+  START TRANSACTION;
+  SELECT total, statut INTO v_total, v_statut
+  FROM commandes WHERE id = p_commande_id FOR UPDATE;
+  IF v_total IS NULL THEN
+    ROLLBACK;
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Commande introuvable';
   END IF;
 
-  SELECT t.prix, t.cout_estime, s.nom INTO v_prix, v_cout, v_nom
-  FROM tarifs t JOIN services s ON s.id = t.service_id
-  WHERE t.id = NEW.tarif_id;
-  IF v_prix IS NULL THEN
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Tarif introuvable';
+  SELECT v_total
+         - COALESCE((SELECT SUM(montant) FROM paiements WHERE commande_id = p_commande_id), 0)
+         + COALESCE((SELECT SUM(montant) FROM remboursements WHERE commande_id = p_commande_id), 0)
+  INTO v_solde;
+
+  IF p_montant <= 0 OR p_montant > v_solde THEN
+    ROLLBACK;
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Montant invalide par rapport au solde';
   END IF;
 
-  SET NEW.prix_unitaire = v_prix;
-  SET NEW.cout_unitaire = v_cout;
-  IF NEW.description IS NULL OR TRIM(NEW.description) = '' THEN
-    SET NEW.description = v_nom;
+  SET @app_user_id = p_utilisateur_id;
+  INSERT INTO paiements(commande_id, session_id, montant, mode, reference, enregistre_par)
+  VALUES (p_commande_id, p_session_id, p_montant, p_mode, p_reference, p_utilisateur_id);
+  COMMIT;
+END$$
+
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_receptionner_ligne` (IN `p_ligne_id` INT, IN `p_quantite` DECIMAL(12,3), IN `p_utilisateur_id` INT)   BEGIN
+  DECLARE v_bon INT;
+  DECLARE v_produit INT;
+  DECLARE v_commande DECIMAL(12,3);
+  DECLARE v_recue DECIMAL(12,3);
+  DECLARE v_prix DECIMAL(12,2);
+  DECLARE v_ref VARCHAR(30);
+  DECLARE v_restantes INT;
+
+  START TRANSACTION;
+  SELECT bon_id, produit_id, quantite_commandee, quantite_recue, prix_unitaire
+    INTO v_bon, v_produit, v_commande, v_recue, v_prix
+  FROM bons_achat_lignes WHERE id = p_ligne_id FOR UPDATE;
+  IF v_produit IS NULL THEN
+    ROLLBACK;
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Ligne de bon introuvable';
   END IF;
+  IF p_quantite <= 0 OR p_quantite > (v_commande - v_recue) THEN
+    ROLLBACK;
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Quantité reçue supérieure au reste à recevoir';
+  END IF;
+
+  SELECT reference INTO v_ref FROM bons_achat WHERE id = v_bon;
+  SET @app_user_id = p_utilisateur_id;
+  INSERT INTO mouvements_stock(produit_id, type, quantite, prix_unitaire, motif, reference_document, utilisateur_id)
+  VALUES (v_produit, 'entree', p_quantite, v_prix, CONCAT('Réception bon ', v_ref), v_ref, p_utilisateur_id);
+
+  UPDATE bons_achat_lignes SET quantite_recue = quantite_recue + p_quantite WHERE id = p_ligne_id;
+
+  SELECT COUNT(*) INTO v_restantes FROM bons_achat_lignes
+  WHERE bon_id = v_bon AND quantite_recue < quantite_commandee;
+  UPDATE bons_achat
+     SET statut = IF(v_restantes = 0, 'recu', 'recu_partiel'),
+         date_reception = IF(v_restantes = 0, CURDATE(), date_reception)
+   WHERE id = v_bon;
+  COMMIT;
 END$$
 
--- Le prix figé à la commande ne peut plus changer
-CREATE TRIGGER trg_lignes_avant_maj BEFORE UPDATE ON commande_lignes
-FOR EACH ROW
-BEGIN
-  SET NEW.prix_unitaire = OLD.prix_unitaire;
-  SET NEW.cout_unitaire = OLD.cout_unitaire;
-END$$
+DELIMITER ;
 
--- Après chaque changement de ligne, on demande le recalcul des totaux
-CREATE TRIGGER trg_lignes_apres_insert AFTER INSERT ON commande_lignes
-FOR EACH ROW
-BEGIN
-  UPDATE commandes SET sous_total = sous_total WHERE id = NEW.commande_id;
-END$$
+-- --------------------------------------------------------
 
-CREATE TRIGGER trg_lignes_apres_maj AFTER UPDATE ON commande_lignes
-FOR EACH ROW
-BEGIN
-  UPDATE commandes SET sous_total = sous_total WHERE id = NEW.commande_id;
-END$$
+--
+-- Table structure for table `alertes_stock`
+--
 
-CREATE TRIGGER trg_lignes_apres_suppr AFTER DELETE ON commande_lignes
-FOR EACH ROW
-BEGIN
-  UPDATE commandes SET sous_total = sous_total WHERE id = OLD.commande_id;
-END$$
+CREATE TABLE `alertes_stock` (
+  `id` int(11) NOT NULL,
+  `produit_id` int(11) NOT NULL,
+  `date_alerte` datetime NOT NULL DEFAULT current_timestamp(),
+  `etat` enum('ouverte','traitee') NOT NULL DEFAULT 'ouverte',
+  `traitee_par` int(11) DEFAULT NULL,
+  `date_traitement` datetime DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Recalcul des totaux et contrôle des changements de statut
-CREATE TRIGGER trg_commande_avant_maj BEFORE UPDATE ON commandes
-FOR EACH ROW
-BEGIN
+--
+-- Dumping data for table `alertes_stock`
+--
+
+INSERT INTO `alertes_stock` (`id`, `produit_id`, `date_alerte`, `etat`, `traitee_par`, `date_traitement`) VALUES
+(1, 1, '2026-11-19 00:08:16', 'traitee', 1, '2026-11-19 02:05:09'),
+(2, 2, '2026-11-19 00:08:16', 'ouverte', NULL, NULL),
+(3, 3, '2026-11-19 00:08:16', 'ouverte', NULL, NULL),
+(4, 4, '2026-11-19 00:08:16', 'ouverte', NULL, NULL),
+(5, 5, '2026-11-19 00:08:16', 'ouverte', NULL, NULL);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `appareils`
+--
+
+CREATE TABLE `appareils` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `nom` varchar(100) NOT NULL,
+  `type` enum('caisse','tablette','telephone','serveur') NOT NULL DEFAULT 'caisse',
+  `actif` tinyint(1) NOT NULL DEFAULT 1,
+  `derniere_synchro` datetime DEFAULT NULL,
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `avis_clients`
+--
+
+CREATE TABLE `avis_clients` (
+  `id` int(11) NOT NULL,
+  `client_id` int(11) NOT NULL,
+  `commande_id` int(11) NOT NULL,
+  `note` tinyint(3) UNSIGNED NOT NULL,
+  `commentaire` varchar(1000) DEFAULT NULL,
+  `statut` enum('nouveau','lu','traite') NOT NULL DEFAULT 'nouveau',
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp()
+) ;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `bons_achat`
+--
+
+CREATE TABLE `bons_achat` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `reference` varchar(30) NOT NULL,
+  `fournisseur_id` int(11) NOT NULL,
+  `date_bon` date NOT NULL,
+  `statut` enum('brouillon','envoye','recu_partiel','recu','annule') NOT NULL DEFAULT 'brouillon',
+  `date_reception` date DEFAULT NULL,
+  `cree_par` int(11) DEFAULT NULL,
+  `notes` varchar(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `bons_achat`
+--
+
+INSERT INTO `bons_achat` (`id`, `uuid`, `reference`, `fournisseur_id`, `date_bon`, `statut`, `date_reception`, `cree_par`, `notes`) VALUES
+(1, '44175afb-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-ACHAT-001', 1, '2026-11-19', 'envoye', NULL, 1, 'Bon démo envoyé — réception simulée séparément dans le stock.'),
+(2, '44182e66-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-ACHAT-002', 2, '2026-11-19', 'brouillon', NULL, 1, 'Bon démo en brouillon.');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `bons_achat_lignes`
+--
+
+CREATE TABLE `bons_achat_lignes` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `bon_id` int(11) NOT NULL,
+  `produit_id` int(11) NOT NULL,
+  `quantite_commandee` decimal(12,3) NOT NULL,
+  `quantite_recue` decimal(12,3) NOT NULL DEFAULT 0.000,
+  `prix_unitaire` decimal(12,2) NOT NULL
+) ;
+
+--
+-- Dumping data for table `bons_achat_lignes`
+--
+
+INSERT INTO `bons_achat_lignes` (`id`, `uuid`, `bon_id`, `produit_id`, `quantite_commandee`, `quantite_recue`, `prix_unitaire`) VALUES
+(1, '441999b5-e3b5-11f1-b0c7-0c5415f01e22', 1, 1, 20.000, 0.000, 2500.00),
+(2, '4419def6-e3b5-11f1-b0c7-0c5415f01e22', 1, 2, 10.000, 0.000, 1800.00),
+(3, '4419eae0-e3b5-11f1-b0c7-0c5415f01e22', 2, 1, 5.000, 0.000, 2500.00);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `clients`
+--
+
+CREATE TABLE `clients` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `nom` varchar(120) NOT NULL,
+  `prenom` varchar(120) DEFAULT NULL,
+  `type_client` enum('particulier','entreprise') NOT NULL DEFAULT 'particulier',
+  `telephone` varchar(30) NOT NULL,
+  `telephone_secondaire` varchar(30) DEFAULT NULL,
+  `email` varchar(160) DEFAULT NULL,
+  `adresse` varchar(255) DEFAULT NULL,
+  `quartier` varchar(120) DEFAULT NULL,
+  `canal_prefere` enum('sms','appel','aucun') NOT NULL DEFAULT 'sms',
+  `accepte_sms` tinyint(1) NOT NULL DEFAULT 0,
+  `accepte_promotions` tinyint(1) NOT NULL DEFAULT 0,
+  `date_consentement` datetime DEFAULT NULL,
+  `notes` text DEFAULT NULL,
+  `supprime` tinyint(1) NOT NULL DEFAULT 0,
+  `version` int(11) NOT NULL DEFAULT 1,
+  `cree_par` int(11) DEFAULT NULL,
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp(),
+  `modifie_le` datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  `utilisateur_id` int(11) DEFAULT NULL
+) ;
+
+--
+-- Dumping data for table `clients`
+--
+
+INSERT INTO `clients` (`id`, `uuid`, `nom`, `prenom`, `type_client`, `telephone`, `telephone_secondaire`, `email`, `adresse`, `quartier`, `canal_prefere`, `accepte_sms`, `accepte_promotions`, `date_consentement`, `notes`, `supprime`, `version`, `cree_par`, `cree_le`, `modifie_le`, `utilisateur_id`) VALUES
+(11, '43f134bc-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 01', 'Amina', 'particulier', 'TEST-CLIENT-01', NULL, 'client.demo01@example.test', 'Adresse de démonstration 1, Yaoundé Centre', 'Yaoundé Centre', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(12, '43f54fb9-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 02', 'Paul', 'particulier', 'TEST-CLIENT-02', NULL, 'client.demo02@example.test', 'Adresse de démonstration 2, Bastos', 'Bastos', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(13, '43fb7bb3-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 03', 'Mireille', 'particulier', 'TEST-CLIENT-03', NULL, 'client.demo03@example.test', 'Adresse de démonstration 3, Mvan', 'Mvan', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(14, '43fdcd19-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 04', 'Samuel', 'particulier', 'TEST-CLIENT-04', NULL, 'client.demo04@example.test', 'Adresse de démonstration 4, Biyem-Assi', 'Biyem-Assi', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(15, '43fdecca-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 05', 'Nadia', 'particulier', 'TEST-CLIENT-05', NULL, 'client.demo05@example.test', 'Adresse de démonstration 5, Essos', 'Essos', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(16, '43fe05c1-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 06', 'Eric', 'particulier', 'TEST-CLIENT-06', NULL, 'client.demo06@example.test', 'Adresse de démonstration 6, Akwa, Douala', 'Akwa, Douala', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(17, '43fe1495-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 07', 'Joëlle', 'particulier', 'TEST-CLIENT-07', NULL, 'client.demo07@example.test', 'Adresse de démonstration 7, Bonapriso, Douala', 'Bonapriso, Douala', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(18, '43fe2114-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 08', 'David', 'particulier', 'TEST-CLIENT-08', NULL, 'client.demo08@example.test', 'Adresse de démonstration 8, Nlongkak', 'Nlongkak', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(19, '43fe2cc8-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 09', 'Clarisse', 'particulier', 'TEST-CLIENT-09', NULL, 'client.demo09@example.test', 'Adresse de démonstration 9, Odza', 'Odza', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(20, '43fe3977-e3b5-11f1-b0c7-0c5415f01e22', 'Démo 10', 'Benoît', 'particulier', 'TEST-CLIENT-10', NULL, 'client.demo10@example.test', 'Adresse de démonstration 10, Mendong', 'Mendong', 'aucun', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL),
+(22, 'a689282b-e45b-11f1-b0c7-0c5415f01e22', 'Valdeshack', 'Client', 'particulier', '+237699999999', NULL, 'Valdeshack@gmail.com', 'Adresse client démo', NULL, 'sms', 0, 0, NULL, NULL, 0, 1, 1, '2026-11-19 21:56:11', '2026-11-19 21:56:11', 34);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `commandes`
+--
+
+CREATE TABLE `commandes` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `reference` varchar(30) NOT NULL,
+  `client_id` int(11) NOT NULL,
+  `depose_par` int(11) DEFAULT NULL,
+  `type_depot` enum('normal','express') NOT NULL DEFAULT 'normal',
+  `mode_remise` enum('retrait','livraison') NOT NULL DEFAULT 'retrait',
+  `statut` enum('recu','lavage','repassage','emballage','pret','retire','annule') NOT NULL DEFAULT 'recu',
+  `date_depot` datetime NOT NULL DEFAULT current_timestamp(),
+  `date_promise` date NOT NULL,
+  `date_pret` datetime DEFAULT NULL,
+  `date_retrait` datetime DEFAULT NULL,
+  `emplacement` varchar(30) DEFAULT NULL,
+  `sous_total` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `remise_montant` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `motif_remise` varchar(255) DEFAULT NULL,
+  `surcharge_express` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `total` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `notes` text DEFAULT NULL,
+  `motif_annulation` varchar(255) DEFAULT NULL,
+  `version` int(11) NOT NULL DEFAULT 1,
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp(),
+  `modifie_le` datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ;
+
+--
+-- Dumping data for table `commandes`
+--
+
+INSERT INTO `commandes` (`id`, `uuid`, `reference`, `client_id`, `depose_par`, `type_depot`, `mode_remise`, `statut`, `date_depot`, `date_promise`, `date_pret`, `date_retrait`, `emplacement`, `sous_total`, `remise_montant`, `motif_remise`, `surcharge_express`, `total`, `notes`, `motif_annulation`, `version`, `cree_le`, `modifie_le`) VALUES
+(11, '43ff6106-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-01', 11, 1, 'normal', 'retrait', 'recu', '2026-11-19 02:05:09', '2026-11-20', NULL, NULL, NULL, 1500.00, 0.00, NULL, 0.00, 1500.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(12, '43ffd8d8-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-02', 12, 1, 'normal', 'retrait', 'lavage', '2026-11-19 02:05:09', '2026-11-21', NULL, NULL, NULL, 3000.00, 0.00, NULL, 0.00, 3000.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(13, '44003ca6-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-03', 13, 1, 'express', 'retrait', 'repassage', '2026-11-19 02:05:09', '2026-11-22', NULL, NULL, NULL, 9000.00, 0.00, NULL, 2700.00, 11700.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(14, '44008e85-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-04', 14, 1, 'normal', 'retrait', 'emballage', '2026-11-19 02:05:09', '2026-11-23', NULL, NULL, NULL, 6000.00, 0.00, NULL, 0.00, 6000.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(15, '44021cac-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-05', 15, 1, 'normal', 'retrait', 'pret', '2026-11-19 02:05:09', '2026-11-24', '2026-11-19 02:05:09', NULL, NULL, 2000.00, 0.00, NULL, 0.00, 2000.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(16, '44075757-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-06', 16, 1, 'normal', 'livraison', 'pret', '2026-11-19 02:05:09', '2026-11-25', '2026-11-19 02:05:09', NULL, NULL, 3000.00, 0.00, NULL, 0.00, 3000.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(17, '4407af72-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-07', 17, 1, 'normal', 'retrait', 'retire', '2026-11-19 02:05:09', '2026-11-26', '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL, 2500.00, 0.00, NULL, 0.00, 2500.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(18, '4407ec48-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-08', 18, 1, 'express', 'retrait', 'lavage', '2026-11-19 02:05:09', '2026-11-27', NULL, NULL, NULL, 5000.00, 0.00, NULL, 1500.00, 6500.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(19, '4408249d-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-09', 19, 1, 'normal', 'retrait', 'recu', '2026-11-19 02:05:09', '2026-11-20', NULL, NULL, NULL, 15000.00, 0.00, NULL, 0.00, 15000.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09'),
+(20, '44085d69-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO-261119-10', 20, 1, 'normal', 'retrait', 'retire', '2026-11-19 02:05:09', '2026-11-21', '2026-11-19 02:05:09', '2026-11-19 02:05:09', NULL, 3500.00, 0.00, NULL, 0.00, 3500.00, 'DONNEE DEMO Pressa — jeu de démonstration', NULL, 1, '2026-11-19 02:05:09', '2026-11-19 02:05:09');
+
+--
+-- Triggers `commandes`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_commande_apres_maj` AFTER UPDATE ON `commandes` FOR EACH ROW BEGIN
+  IF OLD.statut <> NEW.statut THEN
+    INSERT INTO historique_statuts(commande_id, ancien_statut, nouveau_statut, utilisateur_id)
+    VALUES (NEW.id, OLD.statut, NEW.statut, @app_user_id);
+    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
+    VALUES (@app_user_id, 'CHANGEMENT_STATUT', 'commandes', NEW.id, OLD.statut, NEW.statut);
+  END IF;
+  IF OLD.remise_montant <> NEW.remise_montant THEN
+    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
+    VALUES (@app_user_id, 'CHANGEMENT_REMISE', 'commandes', NEW.id, OLD.remise_montant, NEW.remise_montant);
+  END IF;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_commande_avant_maj` BEFORE UPDATE ON `commandes` FOR EACH ROW BEGIN
   DECLARE v_sous DECIMAL(12,2);
   DECLARE v_pct DECIMAL(6,2);
   DECLARE v_surcharge DECIMAL(12,2);
@@ -677,153 +375,504 @@ BEGIN
       SET NEW.date_retrait = NOW();
     END IF;
   END IF;
-END$$
+END
+$$
+DELIMITER ;
 
--- Historique des statuts et journal d'audit
-CREATE TRIGGER trg_commande_apres_maj AFTER UPDATE ON commandes
-FOR EACH ROW
-BEGIN
-  IF OLD.statut <> NEW.statut THEN
-    INSERT INTO historique_statuts(commande_id, ancien_statut, nouveau_statut, utilisateur_id)
-    VALUES (NEW.id, OLD.statut, NEW.statut, @app_user_id);
-    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
-    VALUES (@app_user_id, 'CHANGEMENT_STATUT', 'commandes', NEW.id, OLD.statut, NEW.statut);
-  END IF;
-  IF OLD.remise_montant <> NEW.remise_montant THEN
-    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
-    VALUES (@app_user_id, 'CHANGEMENT_REMISE', 'commandes', NEW.id, OLD.remise_montant, NEW.remise_montant);
-  END IF;
-END$$
+-- --------------------------------------------------------
 
--- ---- 13.2 Paiements : contrôle du solde et immuabilité ----
-CREATE TRIGGER trg_paiement_avant_insert BEFORE INSERT ON paiements
-FOR EACH ROW
-BEGIN
-  DECLARE v_total DECIMAL(12,2);
+--
+-- Table structure for table `commande_lignes`
+--
+
+CREATE TABLE `commande_lignes` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `commande_id` int(11) NOT NULL,
+  `tarif_id` int(11) NOT NULL,
+  `description` varchar(160) NOT NULL,
+  `quantite` int(11) NOT NULL DEFAULT 1,
+  `prix_unitaire` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `cout_unitaire` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `remise_pct` decimal(5,2) NOT NULL DEFAULT 0.00,
+  `sous_total` decimal(12,2) GENERATED ALWAYS AS (round(`quantite` * `prix_unitaire` * (1 - `remise_pct` / 100),0)) STORED
+) ;
+
+--
+-- Dumping data for table `commande_lignes`
+--
+
+INSERT INTO `commande_lignes` (`id`, `uuid`, `commande_id`, `tarif_id`, `description`, `quantite`, `prix_unitaire`, `cout_unitaire`, `remise_pct`) VALUES
+(11, '43ff7b61-e3b5-11f1-b0c7-0c5415f01e22', 11, 1, 'Article de démonstration 01', 1, 1500.00, 650.00, 0.00),
+(12, '44000b17-e3b5-11f1-b0c7-0c5415f01e22', 12, 2, 'Article de démonstration 02', 2, 1500.00, 650.00, 0.00),
+(13, '4400539a-e3b5-11f1-b0c7-0c5415f01e22', 13, 3, 'Article de démonstration 03', 3, 3000.00, 1300.00, 0.00),
+(14, '4400a1aa-e3b5-11f1-b0c7-0c5415f01e22', 14, 4, 'Article de démonstration 04', 1, 6000.00, 2500.00, 0.00),
+(15, '440501a1-e3b5-11f1-b0c7-0c5415f01e22', 15, 5, 'Article de démonstration 05', 2, 1000.00, 350.00, 0.00),
+(16, '44076fe1-e3b5-11f1-b0c7-0c5415f01e22', 16, 6, 'Article de démonstration 06', 3, 1000.00, 350.00, 0.00),
+(17, '4407c020-e3b5-11f1-b0c7-0c5415f01e22', 17, 7, 'Article de démonstration 07', 1, 2500.00, 1050.00, 0.00),
+(18, '4407fb52-e3b5-11f1-b0c7-0c5415f01e22', 18, 8, 'Article de démonstration 08', 2, 2500.00, 1050.00, 0.00),
+(19, '44083323-e3b5-11f1-b0c7-0c5415f01e22', 19, 9, 'Article de démonstration 09', 3, 5000.00, 2400.00, 0.00),
+(20, '44086c24-e3b5-11f1-b0c7-0c5415f01e22', 20, 10, 'Article de démonstration 10', 1, 3500.00, 1600.00, 0.00);
+
+--
+-- Triggers `commande_lignes`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_lignes_apres_insert` AFTER INSERT ON `commande_lignes` FOR EACH ROW BEGIN
+  UPDATE commandes SET sous_total = sous_total WHERE id = NEW.commande_id;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_lignes_apres_maj` AFTER UPDATE ON `commande_lignes` FOR EACH ROW BEGIN
+  UPDATE commandes SET sous_total = sous_total WHERE id = NEW.commande_id;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_lignes_apres_suppr` AFTER DELETE ON `commande_lignes` FOR EACH ROW BEGIN
+  UPDATE commandes SET sous_total = sous_total WHERE id = OLD.commande_id;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_lignes_avant_insert` BEFORE INSERT ON `commande_lignes` FOR EACH ROW BEGIN
+  DECLARE v_prix DECIMAL(12,2);
+  DECLARE v_cout DECIMAL(12,2);
+  DECLARE v_nom VARCHAR(100);
   DECLARE v_statut VARCHAR(20);
-  DECLARE v_solde DECIMAL(12,2);
 
-  SELECT total, statut INTO v_total, v_statut FROM commandes WHERE id = NEW.commande_id;
-  IF v_statut = 'annule' THEN
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Paiement impossible : commande annulée';
+  SELECT statut INTO v_statut FROM commandes WHERE id = NEW.commande_id;
+  IF v_statut IN ('retire','annule') THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Commande clôturée : ajout de ligne impossible';
   END IF;
-  SELECT (v_total
-          - COALESCE((SELECT SUM(montant) FROM paiements WHERE commande_id = NEW.commande_id), 0)
-          + COALESCE((SELECT SUM(montant) FROM remboursements WHERE commande_id = NEW.commande_id), 0))
-  INTO v_solde;
-  IF NEW.montant > v_solde THEN
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Montant supérieur au solde restant';
+
+  SELECT t.prix, t.cout_estime, s.nom INTO v_prix, v_cout, v_nom
+  FROM tarifs t JOIN services s ON s.id = t.service_id
+  WHERE t.id = NEW.tarif_id;
+  IF v_prix IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Tarif introuvable';
   END IF;
-  IF NEW.enregistre_par IS NULL THEN SET NEW.enregistre_par = @app_user_id; END IF;
-END$$
 
-CREATE TRIGGER trg_paiement_apres_insert AFTER INSERT ON paiements
-FOR EACH ROW
-BEGIN
-  INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, nouvelle_valeur)
-  VALUES (NEW.enregistre_par, 'PAIEMENT', 'paiements', NEW.id, CONCAT(NEW.montant, ' FCFA ', NEW.mode));
-  IF NEW.session_id IS NOT NULL AND NEW.mode = 'especes' THEN
-    UPDATE sessions_caisse SET total_theorique = total_theorique + NEW.montant WHERE id = NEW.session_id;
+  SET NEW.prix_unitaire = v_prix;
+  SET NEW.cout_unitaire = v_cout;
+  IF NEW.description IS NULL OR TRIM(NEW.description) = '' THEN
+    SET NEW.description = v_nom;
   END IF;
-END$$
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_lignes_avant_maj` BEFORE UPDATE ON `commande_lignes` FOR EACH ROW BEGIN
+  SET NEW.prix_unitaire = OLD.prix_unitaire;
+  SET NEW.cout_unitaire = OLD.cout_unitaire;
+END
+$$
+DELIMITER ;
 
-CREATE TRIGGER trg_paiement_avant_maj BEFORE UPDATE ON paiements
-FOR EACH ROW
-BEGIN
-  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Paiement non modifiable : utiliser un remboursement';
-END$$
+-- --------------------------------------------------------
 
-CREATE TRIGGER trg_paiement_avant_suppr BEFORE DELETE ON paiements
-FOR EACH ROW
-BEGIN
-  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Paiement non supprimable : utiliser un remboursement';
-END$$
+--
+-- Table structure for table `communications`
+--
 
--- ---- 13.3 Remboursements ----
-CREATE TRIGGER trg_remboursement_avant_insert BEFORE INSERT ON remboursements
-FOR EACH ROW
-BEGIN
-  DECLARE v_solde_encaisse DECIMAL(12,2);
-  SELECT COALESCE((SELECT SUM(montant) FROM paiements WHERE commande_id = NEW.commande_id), 0)
-       - COALESCE((SELECT SUM(montant) FROM remboursements WHERE commande_id = NEW.commande_id), 0)
-  INTO v_solde_encaisse;
-  IF NEW.montant > v_solde_encaisse THEN
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Remboursement supérieur aux sommes encaissées';
-  END IF;
-  IF NEW.enregistre_par IS NULL THEN SET NEW.enregistre_par = @app_user_id; END IF;
-END$$
+CREATE TABLE `communications` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `client_id` int(11) NOT NULL,
+  `commande_id` int(11) DEFAULT NULL,
+  `canal` enum('sms','email','appel','interne') NOT NULL DEFAULT 'sms',
+  `type` enum('commande_recue','commande_prete','rappel_retrait','relance_impaye','promotion','autre') NOT NULL DEFAULT 'autre',
+  `contenu` text NOT NULL,
+  `statut` enum('prepare','envoye','envoye_manuellement','echec','annule') NOT NULL DEFAULT 'prepare',
+  `date_programmee` datetime DEFAULT NULL,
+  `date_envoi` datetime DEFAULT NULL,
+  `cree_par` int(11) DEFAULT NULL,
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp(),
+  `sens` enum('entrant','sortant') NOT NULL DEFAULT 'sortant'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TRIGGER trg_remboursement_apres_insert AFTER INSERT ON remboursements
-FOR EACH ROW
-BEGIN
-  INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, nouvelle_valeur)
-  VALUES (NEW.enregistre_par, 'REMBOURSEMENT', 'remboursements', NEW.id,
-          CONCAT(NEW.montant, ' FCFA - ', NEW.motif));
-  IF NEW.session_id IS NOT NULL AND NEW.mode = 'especes' THEN
-    UPDATE sessions_caisse SET total_theorique = total_theorique - NEW.montant WHERE id = NEW.session_id;
-  END IF;
-END$$
+--
+-- Dumping data for table `communications`
+--
 
--- Sorties d'espèces : dépenses, règlements fournisseurs, salaires
-CREATE TRIGGER trg_depense_apres_insert AFTER INSERT ON depenses
-FOR EACH ROW
-BEGIN
+INSERT INTO `communications` (`id`, `uuid`, `client_id`, `commande_id`, `canal`, `type`, `contenu`, `statut`, `date_programmee`, `date_envoi`, `cree_par`, `cree_le`, `sens`) VALUES
+(5, '44167113-e3b5-11f1-b0c7-0c5415f01e22', 11, 11, 'interne', 'autre', 'DEMO — note interne de démonstration ; aucun SMS envoyé.', 'prepare', NULL, NULL, 1, '2026-11-19 02:05:09', 'sortant'),
+(6, '4416865b-e3b5-11f1-b0c7-0c5415f01e22', 12, 12, 'interne', 'autre', 'DEMO — note interne de démonstration ; aucun SMS envoyé.', 'prepare', NULL, NULL, 1, '2026-11-19 02:05:09', 'sortant'),
+(7, '44169438-e3b5-11f1-b0c7-0c5415f01e22', 15, 15, 'interne', 'autre', 'DEMO — note interne de démonstration ; aucun SMS envoyé.', 'prepare', NULL, NULL, 1, '2026-11-19 02:05:09', 'sortant'),
+(8, '4416a002-e3b5-11f1-b0c7-0c5415f01e22', 16, 16, 'interne', 'autre', 'DEMO — note interne de démonstration ; aucun SMS envoyé.', 'prepare', NULL, NULL, 1, '2026-11-19 02:05:09', 'sortant');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `courses`
+--
+
+CREATE TABLE `courses` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `commande_id` int(11) NOT NULL,
+  `type` enum('collecte','livraison') NOT NULL,
+  `date_prevue` date NOT NULL,
+  `creneau` enum('matin','apres_midi','soir') NOT NULL DEFAULT 'matin',
+  `adresse` varchar(255) DEFAULT NULL,
+  `statut` enum('planifiee','en_cours','effectuee','annulee') NOT NULL DEFAULT 'planifiee',
+  `frais` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `livreur_id` int(11) DEFAULT NULL,
+  `date_realisation` datetime DEFAULT NULL,
+  `notes` varchar(255) DEFAULT NULL
+) ;
+
+--
+-- Dumping data for table `courses`
+--
+
+INSERT INTO `courses` (`id`, `uuid`, `commande_id`, `type`, `date_prevue`, `creneau`, `adresse`, `statut`, `frais`, `livreur_id`, `date_realisation`, `notes`) VALUES
+(2, '44164d0a-e3b5-11f1-b0c7-0c5415f01e22', 16, 'livraison', '2026-11-20', 'matin', 'Adresse de démonstration 6, Akwa, Douala', 'planifiee', 0.00, 21, NULL, 'DEMO — course à attribuer et tester');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `demandes_clients`
+--
+
+CREATE TABLE `demandes_clients` (
+  `id` int(11) NOT NULL,
+  `client_id` int(11) NOT NULL,
+  `type` enum('depot','ramassage') NOT NULL,
+  `date_prevue` date NOT NULL,
+  `creneau` enum('matin','apres_midi','soir') NOT NULL DEFAULT 'matin',
+  `adresse` varchar(255) DEFAULT NULL,
+  `details` varchar(500) DEFAULT NULL,
+  `statut` enum('en_attente','confirmee','refusee','terminee') NOT NULL DEFAULT 'en_attente',
+  `traite_par` int(11) DEFAULT NULL,
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp(),
+  `modifie_le` datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `depenses`
+--
+
+CREATE TABLE `depenses` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `date_depense` date NOT NULL,
+  `categorie` enum('loyer','electricite_eau','produits_lavage','transport','maintenance','internet_telephone','impots_taxes','fournitures','publicite','autre') NOT NULL,
+  `libelle` varchar(160) DEFAULT NULL,
+  `montant` decimal(12,2) NOT NULL,
+  `mode_paiement` enum('especes','mtn_momo','orange_money','virement','carte','cheque') NOT NULL DEFAULT 'especes',
+  `justificatif` varchar(100) DEFAULT NULL,
+  `commentaire` text DEFAULT NULL,
+  `fournisseur_id` int(11) DEFAULT NULL,
+  `intervention_id` int(11) DEFAULT NULL,
+  `session_id` int(11) DEFAULT NULL,
+  `enregistre_par` int(11) DEFAULT NULL,
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp()
+) ;
+
+--
+-- Dumping data for table `depenses`
+--
+
+INSERT INTO `depenses` (`id`, `uuid`, `date_depense`, `categorie`, `libelle`, `montant`, `mode_paiement`, `justificatif`, `commentaire`, `fournisseur_id`, `intervention_id`, `session_id`, `enregistre_par`, `cree_le`) VALUES
+(1, '441f0e12-e3b5-11f1-b0c7-0c5415f01e22', '2026-11-19', 'loyer', 'DEMO — loyer mensuel', 250000.00, 'virement', 'DEMO-JUST-001', 'Montant et justificatif fictifs de démonstration.', NULL, NULL, NULL, 1, '2026-11-19 02:05:09'),
+(2, '44205fe9-e3b5-11f1-b0c7-0c5415f01e22', '2026-11-19', 'electricite_eau', 'DEMO — eau et électricité', 68000.00, 'especes', 'DEMO-JUST-002', 'Montant et justificatif fictifs de démonstration.', NULL, NULL, NULL, 1, '2026-11-19 02:05:09'),
+(3, '4420b5a6-e3b5-11f1-b0c7-0c5415f01e22', '2026-11-19', 'produits_lavage', 'DEMO — réapprovisionnement démo', 42000.00, 'virement', 'DEMO-JUST-003', 'Montant et justificatif fictifs de démonstration.', 2, NULL, NULL, 1, '2026-11-19 02:05:09'),
+(4, '4420da0b-e3b5-11f1-b0c7-0c5415f01e22', '2026-11-19', 'maintenance', 'DEMO — intervention sécheuse', 25000.00, 'virement', 'DEMO-JUST-004', 'Montant et justificatif fictifs de démonstration.', 3, 2, NULL, 1, '2026-11-19 02:05:09');
+
+--
+-- Triggers `depenses`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_depense_apres_insert` AFTER INSERT ON `depenses` FOR EACH ROW BEGIN
   IF NEW.session_id IS NOT NULL AND NEW.mode_paiement = 'especes' THEN
     UPDATE sessions_caisse SET total_theorique = total_theorique - NEW.montant WHERE id = NEW.session_id;
   END IF;
-END$$
+END
+$$
+DELIMITER ;
 
-CREATE TRIGGER trg_reglement_fournisseur_apres_insert AFTER INSERT ON reglements_fournisseurs
-FOR EACH ROW
-BEGIN
-  IF NEW.session_id IS NOT NULL AND NEW.mode = 'especes' THEN
-    UPDATE sessions_caisse SET total_theorique = total_theorique - NEW.montant WHERE id = NEW.session_id;
-  END IF;
-END$$
+-- --------------------------------------------------------
 
-CREATE TRIGGER trg_salaire_apres_insert AFTER INSERT ON salaires
-FOR EACH ROW
-BEGIN
-  IF NEW.session_id IS NOT NULL AND NEW.mode_paiement = 'especes' THEN
-    UPDATE sessions_caisse SET total_theorique = total_theorique - NEW.montant WHERE id = NEW.session_id;
-  END IF;
-END$$
+--
+-- Table structure for table `employes`
+--
 
--- ---- 13.4 Caisse : une session clôturée n'est plus modifiable ----
-CREATE TRIGGER trg_session_avant_maj BEFORE UPDATE ON sessions_caisse
-FOR EACH ROW
-BEGIN
-  IF OLD.date_fermeture IS NOT NULL AND (NEW.total_compte <> OLD.total_compte
-     OR NEW.total_theorique <> OLD.total_theorique) THEN
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Caisse déjà clôturée : montants figés';
-  END IF;
-END$$
+CREATE TABLE `employes` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `utilisateur_id` int(11) DEFAULT NULL,
+  `nom` varchar(120) NOT NULL,
+  `prenom` varchar(120) DEFAULT NULL,
+  `telephone` varchar(30) DEFAULT NULL,
+  `poste` enum('gerant','caissier','accueil','laveur','repasseur','detacheur','emballeur','livreur','comptable','autre') NOT NULL,
+  `date_embauche` date DEFAULT NULL,
+  `salaire_mensuel` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `actif` tinyint(1) NOT NULL DEFAULT 1,
+  `notes` text DEFAULT NULL
+) ;
 
--- ---- 13.5 Tarifs historisés : on ne modifie pas un tarif ----
-CREATE TRIGGER trg_tarif_avant_maj BEFORE UPDATE ON tarifs
-FOR EACH ROW
-BEGIN
-  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Tarif historisé : créer un nouveau tarif avec une nouvelle date d''effet';
-END$$
+--
+-- Dumping data for table `employes`
+--
 
--- ---- 13.6 Utilisateurs : journal des changements de rôle ou d'accès ----
-CREATE TRIGGER trg_utilisateur_apres_maj AFTER UPDATE ON utilisateurs
-FOR EACH ROW
-BEGIN
-  IF OLD.role <> NEW.role THEN
-    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
-    VALUES (@app_user_id, 'CHANGEMENT_ROLE', 'utilisateurs', NEW.id, OLD.role, NEW.role);
-  END IF;
-  IF OLD.actif <> NEW.actif THEN
-    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
-    VALUES (@app_user_id, 'ACTIVATION', 'utilisateurs', NEW.id, OLD.actif, NEW.actif);
-  END IF;
-END$$
+INSERT INTO `employes` (`id`, `uuid`, `utilisateur_id`, `nom`, `prenom`, `telephone`, `poste`, `date_embauche`, `salaire_mensuel`, `actif`, `notes`) VALUES
+(12, '428d5fac-e3b5-11f1-b0c7-0c5415f01e22', 1, 'Administrateur', NULL, NULL, 'gerant', NULL, 0.00, 1, NULL),
+(13, '42a8851e-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Administrateur 01', NULL, NULL, 'gerant', NULL, 0.00, 0, NULL),
+(15, '42e184ff-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Caissier 01', NULL, NULL, 'caissier', NULL, 0.00, 0, NULL),
+(16, '42fcea67-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Caissier 02', NULL, NULL, 'caissier', NULL, 0.00, 0, NULL),
+(17, '43255c41-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Accueil 01', NULL, NULL, 'accueil', NULL, 0.00, 0, NULL),
+(18, '434e4533-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Accueil 02', NULL, NULL, 'accueil', NULL, 0.00, 0, NULL),
+(19, '43719ea2-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Production 01', NULL, NULL, 'laveur', NULL, 0.00, 0, NULL),
+(20, '4395a609-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Production 02', NULL, NULL, 'laveur', NULL, 0.00, 0, NULL),
+(21, '43badc3f-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Livreur 01', NULL, NULL, 'livreur', NULL, 0.00, 0, NULL),
+(22, '43eeddc0-e3b5-11f1-b0c7-0c5415f01e22', NULL, 'Démo Livreur 02', NULL, NULL, 'livreur', NULL, 0.00, 0, NULL),
+(23, 'dae4eae1-e458-11f1-b0c7-0c5415f01e22', NULL, 'Administrateur Démo', NULL, NULL, 'gerant', NULL, 0.00, 0, NULL),
+(24, 'daeed58e-e458-11f1-b0c7-0c5415f01e22', NULL, 'Réceptionniste Démo', NULL, NULL, 'accueil', NULL, 0.00, 0, NULL),
+(25, 'daf91ede-e458-11f1-b0c7-0c5415f01e22', NULL, 'Accueil Démo', NULL, NULL, 'accueil', NULL, 0.00, 0, NULL),
+(26, 'db036062-e458-11f1-b0c7-0c5415f01e22', NULL, 'Caissier Démo', NULL, NULL, 'caissier', NULL, 0.00, 0, NULL),
+(27, 'db0d6aa1-e458-11f1-b0c7-0c5415f01e22', NULL, 'Production Démo', NULL, NULL, 'laveur', NULL, 0.00, 0, NULL),
+(28, 'db174d6c-e458-11f1-b0c7-0c5415f01e22', NULL, 'Livreur Démo', NULL, NULL, 'livreur', NULL, 0.00, 0, NULL),
+(29, 'a6578058-e45b-11f1-b0c7-0c5415f01e22', 29, 'Réceptionniste 67prime', NULL, NULL, 'accueil', NULL, 0.00, 1, NULL),
+(30, 'a66137a8-e45b-11f1-b0c7-0c5415f01e22', 30, 'Daniel Accueil', NULL, NULL, 'accueil', NULL, 0.00, 1, NULL),
+(31, 'a66af0ba-e45b-11f1-b0c7-0c5415f01e22', 31, 'Jojo Mel', NULL, NULL, 'caissier', NULL, 0.00, 1, NULL),
+(32, 'a675384c-e45b-11f1-b0c7-0c5415f01e22', 32, 'Tafu Gw', NULL, NULL, 'laveur', NULL, 0.00, 1, NULL),
+(33, 'a67f37f8-e45b-11f1-b0c7-0c5415f01e22', 33, 'Cris', NULL, NULL, 'livreur', NULL, 0.00, 1, NULL);
 
--- ---- 13.7 Stock : calcul des quantités, refus si stock insuffisant ----
-CREATE TRIGGER trg_mvt_avant_insert BEFORE INSERT ON mouvements_stock
-FOR EACH ROW
-BEGIN
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `equipements`
+--
+
+CREATE TABLE `equipements` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `designation` varchar(150) NOT NULL,
+  `numero_serie` varchar(100) DEFAULT NULL,
+  `categorie` enum('machine_laver','presse','secheuse','table_repassage','generateur','autre') NOT NULL DEFAULT 'autre',
+  `date_acquisition` date DEFAULT NULL,
+  `valeur_acquisition` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `fournisseur_id` int(11) DEFAULT NULL,
+  `etat` enum('en_service','en_panne','hors_service') NOT NULL DEFAULT 'en_service',
+  `actif` tinyint(1) NOT NULL DEFAULT 1
+) ;
+
+--
+-- Dumping data for table `equipements`
+--
+
+INSERT INTO `equipements` (`id`, `uuid`, `designation`, `numero_serie`, `categorie`, `date_acquisition`, `valeur_acquisition`, `fournisseur_id`, `etat`, `actif`) VALUES
+(1, '441c1096-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO — Machine à laver', 'DEMO-MACH-001', 'machine_laver', '2025-11-19', 850000.00, 3, 'en_service', 1),
+(2, '441c5c40-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO — Sécheuse', 'DEMO-SEC-001', 'secheuse', '2026-03-19', 620000.00, 3, 'en_panne', 1);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `file_synchro`
+--
+
+CREATE TABLE `file_synchro` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL,
+  `appareil_uuid` char(36) NOT NULL,
+  `table_cible` varchar(60) NOT NULL,
+  `enregistrement_uuid` char(36) NOT NULL,
+  `operation` enum('insert','update','delete') NOT NULL,
+  `contenu` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL CHECK (json_valid(`contenu`)),
+  `date_locale` datetime(6) NOT NULL,
+  `recu_le` datetime(6) NOT NULL DEFAULT current_timestamp(6),
+  `statut` enum('en_attente','appliquee','conflit','rejetee') NOT NULL DEFAULT 'en_attente',
+  `message_erreur` text DEFAULT NULL,
+  `traitee_le` datetime DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `fournisseurs`
+--
+
+CREATE TABLE `fournisseurs` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `nom` varchar(150) NOT NULL,
+  `telephone` varchar(30) DEFAULT NULL,
+  `email` varchar(160) DEFAULT NULL,
+  `adresse` varchar(255) DEFAULT NULL,
+  `actif` tinyint(1) NOT NULL DEFAULT 1,
+  `notes` text DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `fournisseurs`
+--
+
+INSERT INTO `fournisseurs` (`id`, `uuid`, `nom`, `telephone`, `email`, `adresse`, `actif`, `notes`) VALUES
+(1, '44172a90-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO Fournitures Pressing', 'TEST-FOURN-01', 'fournisseur.demo01@example.test', 'Adresse fournisseur démo 01', 1, 'Données fictives de démonstration Pressa'),
+(2, '44174706-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO Produits & Emballages', 'TEST-FOURN-02', 'fournisseur.demo02@example.test', 'Adresse fournisseur démo 02', 1, 'Données fictives de démonstration Pressa'),
+(3, '4417507d-e3b5-11f1-b0c7-0c5415f01e22', 'DEMO Équipements', 'TEST-FOURN-03', 'fournisseur.demo03@example.test', 'Adresse fournisseur démo 03', 1, 'Données fictives de démonstration Pressa');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `historique_statuts`
+--
+
+CREATE TABLE `historique_statuts` (
+  `id` int(11) NOT NULL,
+  `commande_id` int(11) NOT NULL,
+  `ancien_statut` varchar(20) DEFAULT NULL,
+  `nouveau_statut` varchar(20) NOT NULL,
+  `utilisateur_id` int(11) DEFAULT NULL,
+  `date_changement` datetime(6) NOT NULL DEFAULT current_timestamp(6)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `historique_statuts`
+--
+
+INSERT INTO `historique_statuts` (`id`, `commande_id`, `ancien_statut`, `nouveau_statut`, `utilisateur_id`, `date_changement`) VALUES
+(11, 12, 'recu', 'lavage', 1, '2026-11-19 02:05:09.550358'),
+(12, 13, 'recu', 'repassage', 1, '2026-11-19 02:05:09.559019'),
+(13, 14, 'recu', 'emballage', 1, '2026-11-19 02:05:09.561478'),
+(14, 15, 'recu', 'pret', 1, '2026-11-19 02:05:09.562740'),
+(15, 16, 'recu', 'pret', 1, '2026-11-19 02:05:09.563981'),
+(16, 17, 'recu', 'pret', 1, '2026-11-19 02:05:09.565300'),
+(17, 18, 'recu', 'lavage', 1, '2026-11-19 02:05:09.566625'),
+(18, 20, 'recu', 'pret', 1, '2026-11-19 02:05:09.568535'),
+(19, 17, 'pret', 'retire', 1, '2026-11-19 02:05:09.577552'),
+(20, 20, 'pret', 'retire', 1, '2026-11-19 02:05:09.582050');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `interventions`
+--
+
+CREATE TABLE `interventions` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `equipement_id` int(11) NOT NULL,
+  `date_intervention` date NOT NULL,
+  `type` enum('preventive','corrective','nettoyage','autre') NOT NULL DEFAULT 'corrective',
+  `description` text DEFAULT NULL,
+  `technicien` varchar(120) DEFAULT NULL,
+  `duree_arret_min` int(11) NOT NULL DEFAULT 0,
+  `cout` decimal(12,2) NOT NULL DEFAULT 0.00
+) ;
+
+--
+-- Dumping data for table `interventions`
+--
+
+INSERT INTO `interventions` (`id`, `uuid`, `equipement_id`, `date_intervention`, `type`, `description`, `technicien`, `duree_arret_min`, `cout`) VALUES
+(1, '441ecaaf-e3b5-11f1-b0c7-0c5415f01e22', 1, '2026-11-05', 'preventive', 'DEMO — entretien périodique fictif', 'Technicien démo', 30, 12000.00),
+(2, '441efbbf-e3b5-11f1-b0c7-0c5415f01e22', 2, '2026-11-17', 'corrective', 'DEMO — diagnostic fictif, intervention à planifier', 'Technicien démo', 90, 25000.00);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `journal_audit`
+--
+
+CREATE TABLE `journal_audit` (
+  `id` int(11) NOT NULL,
+  `date_heure` datetime(6) NOT NULL DEFAULT current_timestamp(6),
+  `utilisateur_id` int(11) DEFAULT NULL,
+  `action` varchar(60) NOT NULL,
+  `table_cible` varchar(60) NOT NULL,
+  `enregistrement_id` int(11) DEFAULT NULL,
+  `ancienne_valeur` text DEFAULT NULL,
+  `nouvelle_valeur` text DEFAULT NULL,
+  `appareil_uuid` char(36) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `journal_audit`
+--
+
+INSERT INTO `journal_audit` (`id`, `date_heure`, `utilisateur_id`, `action`, `table_cible`, `enregistrement_id`, `ancienne_valeur`, `nouvelle_valeur`, `appareil_uuid`) VALUES
+(17, '2026-11-19 02:05:09.529311', 1, 'PAIEMENT', 'paiements', 7, NULL, '750.00 FCFA especes', NULL),
+(18, '2026-11-19 02:05:09.533648', 1, 'PAIEMENT', 'paiements', 8, NULL, '3000.00 FCFA mtn_momo', NULL),
+(19, '2026-11-19 02:05:09.534997', 1, 'PAIEMENT', 'paiements', 9, NULL, '2000.00 FCFA orange_money', NULL),
+(20, '2026-11-19 02:05:09.545786', 1, 'PAIEMENT', 'paiements', 10, NULL, '3000.00 FCFA virement', NULL),
+(21, '2026-11-19 02:05:09.548389', 1, 'PAIEMENT', 'paiements', 11, NULL, '2500.00 FCFA carte', NULL),
+(22, '2026-11-19 02:05:09.549618', 1, 'PAIEMENT', 'paiements', 12, NULL, '3500.00 FCFA especes', NULL),
+(23, '2026-11-19 02:05:09.550358', 1, 'CHANGEMENT_STATUT', 'commandes', 12, 'recu', 'lavage', NULL),
+(24, '2026-11-19 02:05:09.559019', 1, 'CHANGEMENT_STATUT', 'commandes', 13, 'recu', 'repassage', NULL),
+(25, '2026-11-19 02:05:09.561478', 1, 'CHANGEMENT_STATUT', 'commandes', 14, 'recu', 'emballage', NULL),
+(26, '2026-11-19 02:05:09.562740', 1, 'CHANGEMENT_STATUT', 'commandes', 15, 'recu', 'pret', NULL),
+(27, '2026-11-19 02:05:09.563981', 1, 'CHANGEMENT_STATUT', 'commandes', 16, 'recu', 'pret', NULL),
+(28, '2026-11-19 02:05:09.565300', 1, 'CHANGEMENT_STATUT', 'commandes', 17, 'recu', 'pret', NULL),
+(29, '2026-11-19 02:05:09.566625', 1, 'CHANGEMENT_STATUT', 'commandes', 18, 'recu', 'lavage', NULL),
+(30, '2026-11-19 02:05:09.568535', 1, 'CHANGEMENT_STATUT', 'commandes', 20, 'recu', 'pret', NULL),
+(31, '2026-11-19 02:05:09.577552', 1, 'CHANGEMENT_STATUT', 'commandes', 17, 'pret', 'retire', NULL),
+(32, '2026-11-19 02:05:09.582050', 1, 'CHANGEMENT_STATUT', 'commandes', 20, 'pret', 'retire', NULL);
+
+--
+-- Triggers `journal_audit`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_journal_avant_maj` BEFORE UPDATE ON `journal_audit` FOR EACH ROW BEGIN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Journal d''audit en lecture seule';
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_journal_avant_suppr` BEFORE DELETE ON `journal_audit` FOR EACH ROW BEGIN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Journal d''audit en lecture seule';
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `mouvements_stock`
+--
+
+CREATE TABLE `mouvements_stock` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `produit_id` int(11) NOT NULL,
+  `type` enum('entree','sortie','ajustement') NOT NULL,
+  `quantite` decimal(12,3) NOT NULL,
+  `prix_unitaire` decimal(12,2) DEFAULT NULL,
+  `quantite_avant` decimal(12,3) NOT NULL DEFAULT 0.000,
+  `quantite_apres` decimal(12,3) NOT NULL DEFAULT 0.000,
+  `cout_moyen_apres` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `motif` varchar(255) DEFAULT NULL,
+  `reference_document` varchar(50) DEFAULT NULL,
+  `utilisateur_id` int(11) DEFAULT NULL,
+  `date_mouvement` datetime(6) NOT NULL DEFAULT current_timestamp(6)
+) ;
+
+--
+-- Dumping data for table `mouvements_stock`
+--
+
+INSERT INTO `mouvements_stock` (`id`, `uuid`, `produit_id`, `type`, `quantite`, `prix_unitaire`, `quantite_avant`, `quantite_apres`, `cout_moyen_apres`, `motif`, `reference_document`, `utilisateur_id`, `date_mouvement`) VALUES
+(1, '441b8c9f-e3b5-11f1-b0c7-0c5415f01e22', 1, 'entree', 12.000, 2500.00, 0.000, 12.000, 2500.00, 'DEMO — stock initial de démonstration', 'DEMO-STOCK-001', 1, '2026-11-19 02:05:09.641917');
+
+--
+-- Triggers `mouvements_stock`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_mvt_apres_insert` AFTER INSERT ON `mouvements_stock` FOR EACH ROW BEGIN
+  UPDATE produits_stock
+     SET quantite_stock = NEW.quantite_apres,
+         cout_moyen = NEW.cout_moyen_apres,
+         version = version + 1
+   WHERE id = NEW.produit_id;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_mvt_avant_insert` BEFORE INSERT ON `mouvements_stock` FOR EACH ROW BEGIN
   DECLARE v_qte DECIMAL(12,3);
   DECLARE v_cout DECIMAL(12,2);
 
@@ -859,298 +908,1354 @@ BEGIN
   END IF;
 
   IF NEW.utilisateur_id IS NULL THEN SET NEW.utilisateur_id = @app_user_id; END IF;
-END$$
-
-CREATE TRIGGER trg_mvt_apres_insert AFTER INSERT ON mouvements_stock
-FOR EACH ROW
-BEGIN
-  UPDATE produits_stock
-     SET quantite_stock = NEW.quantite_apres,
-         cout_moyen = NEW.cout_moyen_apres,
-         version = version + 1
-   WHERE id = NEW.produit_id;
-END$$
-
-CREATE TRIGGER trg_mvt_avant_maj BEFORE UPDATE ON mouvements_stock
-FOR EACH ROW
-BEGIN
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_mvt_avant_maj` BEFORE UPDATE ON `mouvements_stock` FOR EACH ROW BEGIN
   SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Mouvement de stock non modifiable : faire une contre-écriture';
-END$$
-
-CREATE TRIGGER trg_mvt_avant_suppr BEFORE DELETE ON mouvements_stock
-FOR EACH ROW
-BEGIN
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_mvt_avant_suppr` BEFORE DELETE ON `mouvements_stock` FOR EACH ROW BEGIN
   SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Mouvement de stock non supprimable';
-END$$
-
--- ---- 13.8 Alertes : créée au passage sous le seuil, une seule ouverte à la fois ----
-CREATE TRIGGER trg_produit_apres_insert AFTER INSERT ON produits_stock
-FOR EACH ROW
-BEGIN
-  IF NEW.quantite_stock <= NEW.seuil_min THEN
-    INSERT INTO alertes_stock(produit_id, etat) VALUES (NEW.id, 'ouverte');
-  END IF;
-END$$
-
-CREATE TRIGGER trg_produit_apres_maj AFTER UPDATE ON produits_stock
-FOR EACH ROW
-BEGIN
-  IF NEW.quantite_stock <= NEW.seuil_min AND NOT EXISTS (
-       SELECT 1 FROM alertes_stock WHERE produit_id = NEW.id AND etat = 'ouverte') THEN
-    INSERT INTO alertes_stock(produit_id, etat) VALUES (NEW.id, 'ouverte');
-  END IF;
-END$$
-
--- ---- 13.9 Journal d'audit : jamais modifiable ni supprimable ----
-CREATE TRIGGER trg_journal_avant_maj BEFORE UPDATE ON journal_audit
-FOR EACH ROW
-BEGIN
-  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Journal d''audit en lecture seule';
-END$$
-
-CREATE TRIGGER trg_journal_avant_suppr BEFORE DELETE ON journal_audit
-FOR EACH ROW
-BEGIN
-  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Journal d''audit en lecture seule';
-END$$
-
+END
+$$
 DELIMITER ;
 
+-- --------------------------------------------------------
 
--- =====================================================================
---  PROCÉDURES : opérations sensibles en une seule transaction verrouillée
--- =====================================================================
+--
+-- Table structure for table `paiements`
+--
+
+CREATE TABLE `paiements` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `commande_id` int(11) NOT NULL,
+  `session_id` int(11) DEFAULT NULL,
+  `montant` decimal(12,2) NOT NULL,
+  `mode` enum('especes','mtn_momo','orange_money','virement','carte','cheque') NOT NULL,
+  `reference` varchar(100) DEFAULT NULL,
+  `enregistre_par` int(11) DEFAULT NULL,
+  `date_paiement` datetime(6) NOT NULL DEFAULT current_timestamp(6)
+) ;
+
+--
+-- Dumping data for table `paiements`
+--
+
+INSERT INTO `paiements` (`id`, `uuid`, `commande_id`, `session_id`, `montant`, `mode`, `reference`, `enregistre_par`, `date_paiement`) VALUES
+(7, '440a1bb2-e3b5-11f1-b0c7-0c5415f01e22', 12, NULL, 750.00, 'especes', 'DEMO-PAY-02', 1, '2026-11-19 02:05:09.529311'),
+(8, '440ac4b8-e3b5-11f1-b0c7-0c5415f01e22', 14, NULL, 3000.00, 'mtn_momo', 'DEMO-PAY-04', 1, '2026-11-19 02:05:09.533648'),
+(9, '440af80d-e3b5-11f1-b0c7-0c5415f01e22', 15, NULL, 2000.00, 'orange_money', 'DEMO-PAY-05', 1, '2026-11-19 02:05:09.534997'),
+(10, '440ccbcc-e3b5-11f1-b0c7-0c5415f01e22', 16, NULL, 3000.00, 'virement', 'DEMO-PAY-06', 1, '2026-11-19 02:05:09.545786'),
+(11, '440d031b-e3b5-11f1-b0c7-0c5415f01e22', 17, NULL, 2500.00, 'carte', 'DEMO-PAY-07', 1, '2026-11-19 02:05:09.548389'),
+(12, '440d3280-e3b5-11f1-b0c7-0c5415f01e22', 20, NULL, 3500.00, 'especes', 'DEMO-PAY-10', 1, '2026-11-19 02:05:09.549618');
+
+--
+-- Triggers `paiements`
+--
 DELIMITER $$
-
--- Encaissement sûr : verrouille la commande pour éviter les doubles paiements
-CREATE PROCEDURE sp_enregistrer_paiement(
-  IN p_commande_id INT, IN p_montant DECIMAL(12,2), IN p_mode VARCHAR(20),
-  IN p_reference VARCHAR(100), IN p_utilisateur_id INT, IN p_session_id INT)
-BEGIN
+CREATE TRIGGER `trg_paiement_apres_insert` AFTER INSERT ON `paiements` FOR EACH ROW BEGIN
+  INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, nouvelle_valeur)
+  VALUES (NEW.enregistre_par, 'PAIEMENT', 'paiements', NEW.id, CONCAT(NEW.montant, ' FCFA ', NEW.mode));
+  IF NEW.session_id IS NOT NULL AND NEW.mode = 'especes' THEN
+    UPDATE sessions_caisse SET total_theorique = total_theorique + NEW.montant WHERE id = NEW.session_id;
+  END IF;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_paiement_avant_insert` BEFORE INSERT ON `paiements` FOR EACH ROW BEGIN
   DECLARE v_total DECIMAL(12,2);
   DECLARE v_statut VARCHAR(20);
   DECLARE v_solde DECIMAL(12,2);
 
-  START TRANSACTION;
-  SELECT total, statut INTO v_total, v_statut
-  FROM commandes WHERE id = p_commande_id FOR UPDATE;
-  IF v_total IS NULL THEN
-    ROLLBACK;
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Commande introuvable';
+  SELECT total, statut INTO v_total, v_statut FROM commandes WHERE id = NEW.commande_id;
+  IF v_statut = 'annule' THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Paiement impossible : commande annulée';
   END IF;
-
-  SELECT v_total
-         - COALESCE((SELECT SUM(montant) FROM paiements WHERE commande_id = p_commande_id), 0)
-         + COALESCE((SELECT SUM(montant) FROM remboursements WHERE commande_id = p_commande_id), 0)
+  SELECT (v_total
+          - COALESCE((SELECT SUM(montant) FROM paiements WHERE commande_id = NEW.commande_id), 0)
+          + COALESCE((SELECT SUM(montant) FROM remboursements WHERE commande_id = NEW.commande_id), 0))
   INTO v_solde;
-
-  IF p_montant <= 0 OR p_montant > v_solde THEN
-    ROLLBACK;
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Montant invalide par rapport au solde';
+  IF NEW.montant > v_solde THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Montant supérieur au solde restant';
   END IF;
-
-  SET @app_user_id = p_utilisateur_id;
-  INSERT INTO paiements(commande_id, session_id, montant, mode, reference, enregistre_par)
-  VALUES (p_commande_id, p_session_id, p_montant, p_mode, p_reference, p_utilisateur_id);
-  COMMIT;
-END$$
-
--- Réception d'une ligne de bon d'achat : entrée de stock et mise à jour du bon
-CREATE PROCEDURE sp_receptionner_ligne(
-  IN p_ligne_id INT, IN p_quantite DECIMAL(12,3), IN p_utilisateur_id INT)
-BEGIN
-  DECLARE v_bon INT;
-  DECLARE v_produit INT;
-  DECLARE v_commande DECIMAL(12,3);
-  DECLARE v_recue DECIMAL(12,3);
-  DECLARE v_prix DECIMAL(12,2);
-  DECLARE v_ref VARCHAR(30);
-  DECLARE v_restantes INT;
-
-  START TRANSACTION;
-  SELECT bon_id, produit_id, quantite_commandee, quantite_recue, prix_unitaire
-    INTO v_bon, v_produit, v_commande, v_recue, v_prix
-  FROM bons_achat_lignes WHERE id = p_ligne_id FOR UPDATE;
-  IF v_produit IS NULL THEN
-    ROLLBACK;
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Ligne de bon introuvable';
-  END IF;
-  IF p_quantite <= 0 OR p_quantite > (v_commande - v_recue) THEN
-    ROLLBACK;
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Quantité reçue supérieure au reste à recevoir';
-  END IF;
-
-  SELECT reference INTO v_ref FROM bons_achat WHERE id = v_bon;
-  SET @app_user_id = p_utilisateur_id;
-  INSERT INTO mouvements_stock(produit_id, type, quantite, prix_unitaire, motif, reference_document, utilisateur_id)
-  VALUES (v_produit, 'entree', p_quantite, v_prix, CONCAT('Réception bon ', v_ref), v_ref, p_utilisateur_id);
-
-  UPDATE bons_achat_lignes SET quantite_recue = quantite_recue + p_quantite WHERE id = p_ligne_id;
-
-  SELECT COUNT(*) INTO v_restantes FROM bons_achat_lignes
-  WHERE bon_id = v_bon AND quantite_recue < quantite_commandee;
-  UPDATE bons_achat
-     SET statut = IF(v_restantes = 0, 'recu', 'recu_partiel'),
-         date_reception = IF(v_restantes = 0, CURDATE(), date_reception)
-   WHERE id = v_bon;
-  COMMIT;
-END$$
-
--- Clôture de caisse : compare le théorique et le compté, puis fige la session
-CREATE PROCEDURE sp_cloturer_caisse(
-  IN p_session_id INT, IN p_total_compte DECIMAL(12,2), IN p_commentaire TEXT, IN p_utilisateur_id INT)
-BEGIN
-  DECLARE v_fermee DATETIME;
-  SELECT date_fermeture INTO v_fermee FROM sessions_caisse WHERE id = p_session_id FOR UPDATE;
-  IF v_fermee IS NOT NULL THEN
-    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Cette caisse est déjà clôturée';
-  END IF;
-  UPDATE sessions_caisse
-     SET total_compte = p_total_compte,
-         commentaire_ecart = p_commentaire,
-         date_fermeture = NOW(),
-         valide_par = p_utilisateur_id,
-         date_validation = NOW()
-   WHERE id = p_session_id;
-  -- Les espèces encaissées sont rattachées à la session par trigger ci-dessus.
-END$$
-
+  IF NEW.enregistre_par IS NULL THEN SET NEW.enregistre_par = @app_user_id; END IF;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_paiement_avant_maj` BEFORE UPDATE ON `paiements` FOR EACH ROW BEGIN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Paiement non modifiable : utiliser un remboursement';
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_paiement_avant_suppr` BEFORE DELETE ON `paiements` FOR EACH ROW BEGIN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Paiement non supprimable : utiliser un remboursement';
+END
+$$
 DELIMITER ;
 
+-- --------------------------------------------------------
 
--- =====================================================================
---  VUES : indicateurs prêts à l'emploi pour le tableau de bord
--- =====================================================================
+--
+-- Table structure for table `parametres`
+--
 
--- Solde de chaque commande (payé, remboursé, reste à payer)
-CREATE OR REPLACE VIEW vue_commandes_solde AS
-SELECT c.id, c.reference, c.client_id, c.statut, c.total,
-       COALESCE(p.encaisse, 0) - COALESCE(r.rembourse, 0) AS paye,
-       c.total - (COALESCE(p.encaisse, 0) - COALESCE(r.rembourse, 0)) AS reste_a_payer
-FROM commandes c
-LEFT JOIN (SELECT commande_id, SUM(montant) AS encaisse FROM paiements GROUP BY commande_id) p
-       ON p.commande_id = c.id
-LEFT JOIN (SELECT commande_id, SUM(montant) AS rembourse FROM remboursements GROUP BY commande_id) r
-       ON r.commande_id = c.id;
+CREATE TABLE `parametres` (
+  `cle` varchar(60) NOT NULL,
+  `valeur` varchar(255) NOT NULL,
+  `description` varchar(255) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Marge brute estimée par commande (prix de vente - coût estimé)
-CREATE OR REPLACE VIEW vue_marge_commandes AS
-SELECT l.commande_id,
-       SUM(l.sous_total) AS ventes,
-       SUM(l.quantite * l.cout_unitaire) AS couts_estimes,
-       SUM(l.sous_total) - SUM(l.quantite * l.cout_unitaire) AS marge_brute
-FROM commande_lignes l
-GROUP BY l.commande_id;
+--
+-- Dumping data for table `parametres`
+--
 
--- État du stock avec indicateur de réapprovisionnement
-CREATE OR REPLACE VIEW vue_stock_etat AS
-SELECT p.id, p.libelle, p.categorie, p.unite, p.quantite_stock, p.seuil_min, p.cout_moyen,
-       p.quantite_stock * p.cout_moyen AS valeur_stock,
-       (p.quantite_stock <= p.seuil_min) AS a_reapprovisionner
-FROM produits_stock p
-WHERE p.actif = 1;
+INSERT INTO `parametres` (`cle`, `valeur`, `description`) VALUES
+('adresse', 'Yaoundé, Cameroun', 'Adresse du pressing'),
+('delai_defaut_jours', '2', 'Délai par défaut avant retrait prévu'),
+('devise', 'FCFA', 'Devise'),
+('fuseau_horaire', 'Africa/Douala', 'Fuseau horaire de l\'application'),
+('nom_application', 'Pressa', 'Nom du logiciel (titres, icône, domaine)'),
+('nom_pressing', 'Pressa', 'Nom affiché sur les reçus et les SMS'),
+('surcharge_express_pct', '30', 'Majoration pour dépôt express (%)'),
+('telephone', '', 'Téléphone du pressing'),
+('tva_pct', '0', 'TVA (0 si non assujetti)');
 
--- Solde dû à chaque fournisseur : achats reçus moins règlements
-CREATE OR REPLACE VIEW vue_fournisseurs_solde AS
-SELECT f.id, f.nom,
-       COALESCE((SELECT SUM(bl.quantite_recue * bl.prix_unitaire)
-                 FROM bons_achat_lignes bl JOIN bons_achat b ON b.id = bl.bon_id
-                 WHERE b.fournisseur_id = f.id), 0)
-       - COALESCE((SELECT SUM(r.montant) FROM reglements_fournisseurs r
-                   WHERE r.fournisseur_id = f.id), 0) AS solde_du
-FROM fournisseurs f;
+-- --------------------------------------------------------
 
--- Commandes en retard : non retirées après la date promise
-CREATE OR REPLACE VIEW vue_commandes_en_retard AS
-SELECT c.id, c.reference, c.statut, c.date_promise, cl.nom, cl.prenom, cl.telephone
-FROM commandes c JOIN clients cl ON cl.id = c.client_id
-WHERE c.statut NOT IN ('retire','annule') AND c.date_promise < CURDATE();
+--
+-- Table structure for table `presences`
+--
 
--- Tableau de bord du mois en cours (une seule ligne)
-CREATE OR REPLACE VIEW vue_tableau_bord AS
-SELECT
-  (SELECT COUNT(*) FROM clients WHERE supprime = 0) AS clients_total,
-  (SELECT COUNT(*) FROM commandes WHERE statut NOT IN ('retire','annule')) AS commandes_en_cours,
-  (SELECT COUNT(*) FROM commandes WHERE statut = 'pret') AS commandes_pretes,
-  (SELECT COUNT(*) FROM vue_commandes_en_retard) AS commandes_en_retard,
-  (SELECT COALESCE(SUM(montant),0) FROM paiements
-    WHERE YEAR(date_paiement) = YEAR(CURDATE()) AND MONTH(date_paiement) = MONTH(CURDATE())) AS encaissements_mois,
-  (SELECT COALESCE(SUM(montant),0) FROM depenses
-    WHERE YEAR(date_depense) = YEAR(CURDATE()) AND MONTH(date_depense) = MONTH(CURDATE())) AS depenses_mois,
-  (SELECT COUNT(*) FROM alertes_stock WHERE etat = 'ouverte') AS alertes_stock_ouvertes;
+CREATE TABLE `presences` (
+  `id` int(11) NOT NULL,
+  `employe_id` int(11) NOT NULL,
+  `date_presence` date NOT NULL,
+  `creneau` enum('matin','apres_midi','journee') NOT NULL DEFAULT 'journee',
+  `statut` enum('present','absent','retard','conge','repos') NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `presences`
+--
 
--- =====================================================================
---  DONNÉES DE DÉPART (modifiables depuis l'application)
---  Les triggers de stock et d'alerte sont déjà créés : les alertes
---  initiales sont donc générées correctement (bug corrigé).
--- =====================================================================
+INSERT INTO `presences` (`id`, `employe_id`, `date_presence`, `creneau`, `statut`) VALUES
+(1, 12, '2026-11-19', 'journee', 'present'),
+(2, 13, '2026-11-19', 'matin', 'present'),
+(4, 15, '2026-11-19', 'matin', 'retard'),
+(5, 16, '2026-11-19', 'apres_midi', 'present'),
+(6, 17, '2026-11-19', 'matin', 'present'),
+(7, 18, '2026-11-19', 'apres_midi', 'present'),
+(8, 19, '2026-11-19', 'matin', 'present'),
+(9, 20, '2026-11-19', 'apres_midi', 'present'),
+(10, 21, '2026-11-19', 'matin', 'present'),
+(11, 22, '2026-11-19', 'apres_midi', 'present');
 
-INSERT INTO parametres (cle, valeur, description) VALUES
- ('nom_application',        'Pressa',              'Nom du logiciel (titres, icône, domaine)'),
- ('nom_pressing',           'Pressing de la joie', 'Nom affiché sur les reçus et les SMS'),
- ('telephone',              '',                    'Téléphone du pressing'),
- ('adresse',                'Yaoundé, Cameroun',   'Adresse du pressing'),
- ('devise',                 'FCFA',                'Devise'),
- ('surcharge_express_pct',  '30',                  'Majoration pour dépôt express (%)'),
- ('delai_defaut_jours',     '2',                   'Délai par défaut avant retrait prévu'),
- ('tva_pct',                '0',                   'TVA (0 si non assujetti)'),
- ('fuseau_horaire',         'Africa/Douala',       'Fuseau horaire de l''application');
+-- --------------------------------------------------------
 
-INSERT INTO services (code, nom, description, delai_jours) VALUES
- ('LAV',  'Lavage simple',       'Lavage seul',                   2),
- ('REP',  'Repassage seul',      'Repassage seul',                1),
- ('LR',   'Lavage + repassage',  'Forfait complet',               2),
- ('NET',  'Nettoyage à sec',     'Textiles délicats et costumes', 3),
- ('DET',  'Détachage',           'Traitement des taches',         2);
+--
+-- Table structure for table `produits_stock`
+--
 
-INSERT INTO types_articles (nom, unite) VALUES
- ('Chemise', 'piece'), ('Pantalon', 'piece'), ('Robe', 'piece'),
- ('Costume', 'ensemble'), ('Veste', 'piece'), ('Drap', 'piece'), ('Couette', 'piece');
+CREATE TABLE `produits_stock` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `reference` varchar(30) DEFAULT NULL,
+  `libelle` varchar(150) NOT NULL,
+  `categorie` enum('consommable','emballage','outillage','autre') NOT NULL DEFAULT 'consommable',
+  `unite` enum('kg','litre','paquet','piece','bidon') NOT NULL DEFAULT 'piece',
+  `quantite_stock` decimal(12,3) NOT NULL DEFAULT 0.000,
+  `seuil_min` decimal(12,3) NOT NULL DEFAULT 0.000,
+  `cout_moyen` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `actif` tinyint(1) NOT NULL DEFAULT 1,
+  `version` int(11) NOT NULL DEFAULT 1
+) ;
 
--- Tarifs de départ en FCFA (à adapter à vos coûts réels)
-INSERT INTO tarifs (service_id, type_article_id, prix, cout_estime, date_effet)
-SELECT s.id, t.id, x.prix, x.cout, '2026-01-01'
-FROM (
-  SELECT 'LAV' AS sc, 'Chemise' AS tn, 1500 AS prix, 650 AS cout UNION ALL
-  SELECT 'LAV', 'Pantalon', 1500, 650 UNION ALL
-  SELECT 'LAV', 'Drap', 3000, 1300 UNION ALL
-  SELECT 'LAV', 'Couette', 6000, 2500 UNION ALL
-  SELECT 'REP', 'Chemise', 1000, 350 UNION ALL
-  SELECT 'REP', 'Pantalon', 1000, 350 UNION ALL
-  SELECT 'LR',  'Chemise', 2500, 1050 UNION ALL
-  SELECT 'LR',  'Pantalon', 2500, 1050 UNION ALL
-  SELECT 'NET', 'Costume', 5000, 2400 UNION ALL
-  SELECT 'NET', 'Robe', 3500, 1600 UNION ALL
-  SELECT 'NET', 'Veste', 4000, 1900 UNION ALL
-  SELECT 'DET', 'Chemise', 1000, 300
-) x
-JOIN services s ON s.code = x.sc
-JOIN types_articles t ON t.nom = x.tn;
+--
+-- Dumping data for table `produits_stock`
+--
 
-INSERT INTO produits_stock (reference, libelle, categorie, unite, seuil_min) VALUES
- ('LESS-01', 'Lessive professionnelle', 'consommable', 'kg',     5),
- ('ADOU-01', 'Adoucissant',             'consommable', 'litre',  3),
- ('DETA-01', 'Détachant',               'consommable', 'litre',  2),
- ('EMBA-01', 'Emballages plastique',    'emballage',   'paquet', 5),
- ('CINT-01', 'Cintres',                 'emballage',   'piece',  50);
+INSERT INTO `produits_stock` (`id`, `uuid`, `reference`, `libelle`, `categorie`, `unite`, `quantite_stock`, `seuil_min`, `cout_moyen`, `actif`, `version`) VALUES
+(1, 'efec4763-e3a4-11f1-b0c7-0c5415f01e22', 'LESS-01', 'Lessive professionnelle', 'consommable', 'kg', 12.000, 5.000, 2500.00, 1, 2),
+(2, 'efecc121-e3a4-11f1-b0c7-0c5415f01e22', 'ADOU-01', 'Adoucissant', 'consommable', 'litre', 0.000, 3.000, 0.00, 1, 1),
+(3, 'efecc38b-e3a4-11f1-b0c7-0c5415f01e22', 'DETA-01', 'Détachant', 'consommable', 'litre', 0.000, 2.000, 0.00, 1, 1),
+(4, 'efecc592-e3a4-11f1-b0c7-0c5415f01e22', 'EMBA-01', 'Emballages plastique', 'emballage', 'paquet', 0.000, 5.000, 0.00, 1, 1),
+(5, 'efecc6c3-e3a4-11f1-b0c7-0c5415f01e22', 'CINT-01', 'Cintres', 'emballage', 'piece', 0.000, 50.000, 0.00, 1, 1);
 
+--
+-- Triggers `produits_stock`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_produit_apres_insert` AFTER INSERT ON `produits_stock` FOR EACH ROW BEGIN
+  IF NEW.quantite_stock <= NEW.seuil_min THEN
+    INSERT INTO alertes_stock(produit_id, etat) VALUES (NEW.id, 'ouverte');
+  END IF;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_produit_apres_maj` AFTER UPDATE ON `produits_stock` FOR EACH ROW BEGIN
+  IF NEW.quantite_stock <= NEW.seuil_min AND NOT EXISTS (
+       SELECT 1 FROM alertes_stock WHERE produit_id = NEW.id AND etat = 'ouverte') THEN
+    INSERT INTO alertes_stock(produit_id, etat) VALUES (NEW.id, 'ouverte');
+  END IF;
+END
+$$
+DELIMITER ;
 
--- =====================================================================
---  CONTRÔLE : ce que le script a créé
--- =====================================================================
-SELECT COUNT(*) AS nombre_de_tables
-FROM information_schema.tables WHERE table_schema = 'pressa' AND table_type = 'BASE TABLE';
+-- --------------------------------------------------------
 
-SELECT COUNT(*) AS nombre_de_triggers FROM information_schema.triggers WHERE trigger_schema = 'pressa';
+--
+-- Table structure for table `reclamations`
+--
 
-SELECT COUNT(*) AS alertes_stock_initiales FROM alertes_stock;
+CREATE TABLE `reclamations` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `client_id` int(11) NOT NULL,
+  `commande_id` int(11) DEFAULT NULL,
+  `date_reclamation` date NOT NULL,
+  `nature` varchar(120) NOT NULL,
+  `demande` text DEFAULT NULL,
+  `decision` text DEFAULT NULL,
+  `statut` enum('ouverte','en_cours','cloturee') NOT NULL DEFAULT 'ouverte',
+  `traite_par` int(11) DEFAULT NULL,
+  `date_info_client` date DEFAULT NULL,
+  `date_cloture` datetime DEFAULT NULL
+) ;
 
--- =====================================================================
---  CRÉATION DU PREMIER ADMINISTRATEUR (à faire UNE fois, depuis PHP)
---  Ne mettez jamais de mot de passe en clair dans ce fichier.
---  Dans un terminal PHP :  php -r "echo password_hash('VotreMotDePasse', PASSWORD_DEFAULT);"
---  Puis exécutez :
---    INSERT INTO utilisateurs (nom, email, mot_de_passe, role)
---    VALUES ('Administrateur', 'admin@pressa.local', '<hash-obtenu>', 'admin');
--- =====================================================================
+--
+-- Dumping data for table `reclamations`
+--
+
+INSERT INTO `reclamations` (`id`, `uuid`, `client_id`, `commande_id`, `date_reclamation`, `nature`, `demande`, `decision`, `statut`, `traite_par`, `date_info_client`, `date_cloture`) VALUES
+(1, '4416c1e0-e3b5-11f1-b0c7-0c5415f01e22', 13, 13, '2026-11-19', 'DEMO — délai de traitement', 'Exemple fictif de réclamation.', 'Suivi de démonstration.', 'en_cours', 1, NULL, NULL),
+(2, '44171220-e3b5-11f1-b0c7-0c5415f01e22', 17, 17, '2026-11-18', 'DEMO — article à vérifier', 'Exemple fictif de demande client.', 'Dossier démo clôturé.', 'cloturee', 1, '2026-11-19', '2026-11-19 00:00:00');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `reglements_fournisseurs`
+--
+
+CREATE TABLE `reglements_fournisseurs` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `fournisseur_id` int(11) NOT NULL,
+  `bon_id` int(11) DEFAULT NULL,
+  `session_id` int(11) DEFAULT NULL,
+  `montant` decimal(12,2) NOT NULL,
+  `mode` enum('especes','mtn_momo','orange_money','virement','cheque') NOT NULL DEFAULT 'virement',
+  `reference` varchar(100) DEFAULT NULL,
+  `enregistre_par` int(11) DEFAULT NULL,
+  `date_reglement` datetime(6) NOT NULL DEFAULT current_timestamp(6)
+) ;
+
+--
+-- Dumping data for table `reglements_fournisseurs`
+--
+
+INSERT INTO `reglements_fournisseurs` (`id`, `uuid`, `fournisseur_id`, `bon_id`, `session_id`, `montant`, `mode`, `reference`, `enregistre_par`, `date_reglement`) VALUES
+(1, '4419f905-e3b5-11f1-b0c7-0c5415f01e22', 1, 1, NULL, 5000.00, 'virement', 'DEMO-REG-001', 1, '2026-11-19 02:05:09.633298');
+
+--
+-- Triggers `reglements_fournisseurs`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_reglement_fournisseur_apres_insert` AFTER INSERT ON `reglements_fournisseurs` FOR EACH ROW BEGIN
+  IF NEW.session_id IS NOT NULL AND NEW.mode = 'especes' THEN
+    UPDATE sessions_caisse SET total_theorique = total_theorique - NEW.montant WHERE id = NEW.session_id;
+  END IF;
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `remboursements`
+--
+
+CREATE TABLE `remboursements` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `commande_id` int(11) NOT NULL,
+  `session_id` int(11) DEFAULT NULL,
+  `montant` decimal(12,2) NOT NULL,
+  `mode` enum('especes','mtn_momo','orange_money','virement','carte','cheque') NOT NULL DEFAULT 'especes',
+  `motif` varchar(255) NOT NULL,
+  `enregistre_par` int(11) DEFAULT NULL,
+  `date_remboursement` datetime(6) NOT NULL DEFAULT current_timestamp(6)
+) ;
+
+--
+-- Triggers `remboursements`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_remboursement_apres_insert` AFTER INSERT ON `remboursements` FOR EACH ROW BEGIN
+  INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, nouvelle_valeur)
+  VALUES (NEW.enregistre_par, 'REMBOURSEMENT', 'remboursements', NEW.id,
+          CONCAT(NEW.montant, ' FCFA - ', NEW.motif));
+  IF NEW.session_id IS NOT NULL AND NEW.mode = 'especes' THEN
+    UPDATE sessions_caisse SET total_theorique = total_theorique - NEW.montant WHERE id = NEW.session_id;
+  END IF;
+END
+$$
+DELIMITER ;
+DELIMITER $$
+CREATE TRIGGER `trg_remboursement_avant_insert` BEFORE INSERT ON `remboursements` FOR EACH ROW BEGIN
+  DECLARE v_solde_encaisse DECIMAL(12,2);
+  SELECT COALESCE((SELECT SUM(montant) FROM paiements WHERE commande_id = NEW.commande_id), 0)
+       - COALESCE((SELECT SUM(montant) FROM remboursements WHERE commande_id = NEW.commande_id), 0)
+  INTO v_solde_encaisse;
+  IF NEW.montant > v_solde_encaisse THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Remboursement supérieur aux sommes encaissées';
+  END IF;
+  IF NEW.enregistre_par IS NULL THEN SET NEW.enregistre_par = @app_user_id; END IF;
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `salaires`
+--
+
+CREATE TABLE `salaires` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `employe_id` int(11) NOT NULL,
+  `periode` char(7) NOT NULL,
+  `montant` decimal(12,2) NOT NULL,
+  `date_paiement` date NOT NULL,
+  `mode_paiement` enum('especes','mtn_momo','orange_money','virement') NOT NULL DEFAULT 'especes',
+  `session_id` int(11) DEFAULT NULL,
+  `enregistre_par` int(11) DEFAULT NULL
+) ;
+
+--
+-- Triggers `salaires`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_salaire_apres_insert` AFTER INSERT ON `salaires` FOR EACH ROW BEGIN
+  IF NEW.session_id IS NOT NULL AND NEW.mode_paiement = 'especes' THEN
+    UPDATE sessions_caisse SET total_theorique = total_theorique - NEW.montant WHERE id = NEW.session_id;
+  END IF;
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `services`
+--
+
+CREATE TABLE `services` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `code` varchar(20) NOT NULL,
+  `nom` varchar(100) NOT NULL,
+  `description` varchar(255) DEFAULT NULL,
+  `delai_jours` int(11) NOT NULL DEFAULT 2,
+  `actif` tinyint(1) NOT NULL DEFAULT 1
+) ;
+
+--
+-- Dumping data for table `services`
+--
+
+INSERT INTO `services` (`id`, `uuid`, `code`, `nom`, `description`, `delai_jours`, `actif`) VALUES
+(1, 'efeab525-e3a4-11f1-b0c7-0c5415f01e22', 'LAV', 'Lavage simple', 'Lavage seul', 2, 1),
+(2, 'efeaeed2-e3a4-11f1-b0c7-0c5415f01e22', 'REP', 'Repassage seul', 'Repassage seul', 1, 1),
+(3, 'efeaf18d-e3a4-11f1-b0c7-0c5415f01e22', 'LR', 'Lavage + repassage', 'Forfait complet', 2, 1),
+(4, 'efeaf200-e3a4-11f1-b0c7-0c5415f01e22', 'NET', 'Nettoyage à sec', 'Textiles délicats et costumes', 3, 1),
+(5, 'efeaf263-e3a4-11f1-b0c7-0c5415f01e22', 'DET', 'Détachage', 'Traitement des taches', 2, 1);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `sessions_caisse`
+--
+
+CREATE TABLE `sessions_caisse` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `utilisateur_id` int(11) NOT NULL,
+  `date_ouverture` datetime NOT NULL DEFAULT current_timestamp(),
+  `fond_ouverture` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `date_fermeture` datetime DEFAULT NULL,
+  `total_theorique` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `total_compte` decimal(12,2) DEFAULT NULL,
+  `ecart` decimal(12,2) GENERATED ALWAYS AS (`total_compte` - (`fond_ouverture` + `total_theorique`)) STORED,
+  `commentaire_ecart` text DEFAULT NULL,
+  `valide_par` int(11) DEFAULT NULL,
+  `date_validation` datetime DEFAULT NULL
+) ;
+
+--
+-- Triggers `sessions_caisse`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_session_avant_maj` BEFORE UPDATE ON `sessions_caisse` FOR EACH ROW BEGIN
+  IF OLD.date_fermeture IS NOT NULL AND (NEW.total_compte <> OLD.total_compte
+     OR NEW.total_theorique <> OLD.total_theorique) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Caisse déjà clôturée : montants figés';
+  END IF;
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `tarifs`
+--
+
+CREATE TABLE `tarifs` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `service_id` int(11) NOT NULL,
+  `type_article_id` int(11) NOT NULL,
+  `prix` decimal(12,2) NOT NULL,
+  `cout_estime` decimal(12,2) NOT NULL DEFAULT 0.00,
+  `date_effet` date NOT NULL
+) ;
+
+--
+-- Dumping data for table `tarifs`
+--
+
+INSERT INTO `tarifs` (`id`, `uuid`, `service_id`, `type_article_id`, `prix`, `cout_estime`, `date_effet`) VALUES
+(1, 'efebcab8-e3a4-11f1-b0c7-0c5415f01e22', 1, 1, 1500.00, 650.00, '2026-01-01'),
+(2, 'efebf0a4-e3a4-11f1-b0c7-0c5415f01e22', 1, 2, 1500.00, 650.00, '2026-01-01'),
+(3, 'efebf2df-e3a4-11f1-b0c7-0c5415f01e22', 1, 6, 3000.00, 1300.00, '2026-01-01'),
+(4, 'efebf3d6-e3a4-11f1-b0c7-0c5415f01e22', 1, 7, 6000.00, 2500.00, '2026-01-01'),
+(5, 'efebf4c0-e3a4-11f1-b0c7-0c5415f01e22', 2, 1, 1000.00, 350.00, '2026-01-01'),
+(6, 'efebf589-e3a4-11f1-b0c7-0c5415f01e22', 2, 2, 1000.00, 350.00, '2026-01-01'),
+(7, 'efebf64f-e3a4-11f1-b0c7-0c5415f01e22', 3, 1, 2500.00, 1050.00, '2026-01-01'),
+(8, 'efebf702-e3a4-11f1-b0c7-0c5415f01e22', 3, 2, 2500.00, 1050.00, '2026-01-01'),
+(9, 'efebf7d0-e3a4-11f1-b0c7-0c5415f01e22', 4, 4, 5000.00, 2400.00, '2026-01-01'),
+(10, 'efebf888-e3a4-11f1-b0c7-0c5415f01e22', 4, 3, 3500.00, 1600.00, '2026-01-01'),
+(11, 'efebf945-e3a4-11f1-b0c7-0c5415f01e22', 4, 5, 4000.00, 1900.00, '2026-01-01'),
+(12, 'efebfa0d-e3a4-11f1-b0c7-0c5415f01e22', 5, 1, 1000.00, 300.00, '2026-01-01');
+
+--
+-- Triggers `tarifs`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_tarif_avant_maj` BEFORE UPDATE ON `tarifs` FOR EACH ROW BEGIN
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Tarif historisé : créer un nouveau tarif avec une nouvelle date d''effet';
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `types_articles`
+--
+
+CREATE TABLE `types_articles` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `nom` varchar(100) NOT NULL,
+  `unite` enum('piece','ensemble','kg') NOT NULL DEFAULT 'piece',
+  `actif` tinyint(1) NOT NULL DEFAULT 1
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `types_articles`
+--
+
+INSERT INTO `types_articles` (`id`, `uuid`, `nom`, `unite`, `actif`) VALUES
+(1, 'efeb508a-e3a4-11f1-b0c7-0c5415f01e22', 'Chemise', 'piece', 1),
+(2, 'efeb6420-e3a4-11f1-b0c7-0c5415f01e22', 'Pantalon', 'piece', 1),
+(3, 'efeb6575-e3a4-11f1-b0c7-0c5415f01e22', 'Robe', 'piece', 1),
+(4, 'efeb65be-e3a4-11f1-b0c7-0c5415f01e22', 'Costume', 'ensemble', 1),
+(5, 'efeb65fb-e3a4-11f1-b0c7-0c5415f01e22', 'Veste', 'piece', 1),
+(6, 'efeb6637-e3a4-11f1-b0c7-0c5415f01e22', 'Drap', 'piece', 1),
+(7, 'efeb666b-e3a4-11f1-b0c7-0c5415f01e22', 'Couette', 'piece', 1);
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `utilisateurs`
+--
+
+CREATE TABLE `utilisateurs` (
+  `id` int(11) NOT NULL,
+  `uuid` char(36) NOT NULL DEFAULT uuid(),
+  `nom` varchar(120) NOT NULL,
+  `email` varchar(160) NOT NULL,
+  `mot_de_passe` varchar(255) NOT NULL,
+  `role` enum('admin','caissier','accueil','receptionniste','production','livreur','client') NOT NULL DEFAULT 'accueil',
+  `actif` tinyint(1) NOT NULL DEFAULT 1,
+  `tentatives_echec` int(11) NOT NULL DEFAULT 0,
+  `verrouille_jusqu_a` datetime DEFAULT NULL,
+  `derniere_connexion` datetime DEFAULT NULL,
+  `cree_le` datetime NOT NULL DEFAULT current_timestamp(),
+  `modifie_le` datetime NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `utilisateurs`
+--
+
+INSERT INTO `utilisateurs` (`id`, `uuid`, `nom`, `email`, `mot_de_passe`, `role`, `actif`, `tentatives_echec`, `verrouille_jusqu_a`, `derniere_connexion`, `cree_le`, `modifie_le`) VALUES
+(1, '123', 'Administrateur', 'pressa.admin.initial@gmail.com', '$2y$10$QkRGTvXltDFwe6ghTKccOuhywtZkV0iDtoTw/rb4FlWIfR6BrEeK.', 'admin', 1, 0, NULL, '2026-11-19 22:00:20', '2026-11-19 00:34:59', '2026-11-19 22:00:20'),
+(29, 'a6576dad-e45b-11f1-b0c7-0c5415f01e22', 'Réceptionniste 67prime', '67prime.ess@gmail.com', '$2y$10$21IiLRWkdCoTDn3A7EG/6OfJLcuOrVBrNbuc4Oj8ylifAK.o092iu', 'receptionniste', 1, 0, NULL, '2026-11-19 22:13:27', '2026-11-19 21:56:10', '2026-11-19 22:13:27'),
+(30, 'a6612577-e45b-11f1-b0c7-0c5415f01e22', 'Daniel Accueil', 'Daniel@gmail.com', '$2y$10$zw2m55egIWe.eI9C30c05uNvABuf/PoL2ban36dC/bxj4u28utX0O', 'accueil', 1, 0, NULL, NULL, '2026-11-19 21:56:10', '2026-11-19 21:56:10'),
+(31, 'a66adddc-e45b-11f1-b0c7-0c5415f01e22', 'Jojo Mel', 'jojomel@gmail.com', '$2y$10$ry9k6FbSyXsg0LzAZJZfzOhCILQkfFQw9qPcYavJ2flpHlMo5pgdC', 'caissier', 1, 0, NULL, NULL, '2026-11-19 21:56:10', '2026-11-19 21:56:10'),
+(32, 'a6752742-e45b-11f1-b0c7-0c5415f01e22', 'Tafu Gw', 'tafugw@gmail.com', '$2y$10$zJzj/ESbKfrk4/lW2jcZrOTtk/MW1wim2.1EVSBxgWsVMQao58UL6', 'production', 1, 0, NULL, NULL, '2026-11-19 21:56:11', '2026-11-19 21:56:11'),
+(33, 'a67f269f-e45b-11f1-b0c7-0c5415f01e22', 'Cris', 'Cris@gmail.com', '$2y$10$JsITTun0Xedsn4.4FhZlmesJkO405lmSP1FWmU7c61VvKsVAo2sqe', 'livreur', 1, 0, NULL, '2026-11-19 22:01:57', '2026-11-19 21:56:11', '2026-11-19 22:01:57'),
+(34, 'a688e856-e45b-11f1-b0c7-0c5415f01e22', 'Valdeshack', 'Valdeshack@gmail.com', '$2y$10$Fjw6vGyP8YnQ1ppdnzawEuyl61Rpr3NYOWhcR2DdFryOTF1fIkogu', 'client', 1, 0, NULL, NULL, '2026-11-19 21:56:11', '2026-11-19 21:56:11');
+
+--
+-- Triggers `utilisateurs`
+--
+DELIMITER $$
+CREATE TRIGGER `trg_utilisateur_apres_maj` AFTER UPDATE ON `utilisateurs` FOR EACH ROW BEGIN
+  IF OLD.role <> NEW.role THEN
+    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
+    VALUES (@app_user_id, 'CHANGEMENT_ROLE', 'utilisateurs', NEW.id, OLD.role, NEW.role);
+  END IF;
+  IF OLD.actif <> NEW.actif THEN
+    INSERT INTO journal_audit(utilisateur_id, action, table_cible, enregistrement_id, ancienne_valeur, nouvelle_valeur)
+    VALUES (@app_user_id, 'ACTIVATION', 'utilisateurs', NEW.id, OLD.actif, NEW.actif);
+  END IF;
+END
+$$
+DELIMITER ;
+
+-- --------------------------------------------------------
+
+--
+-- Stand-in structure for view `vue_commandes_en_retard`
+-- (See below for the actual view)
+--
+CREATE TABLE `vue_commandes_en_retard` (
+`id` int(11)
+,`reference` varchar(30)
+,`statut` enum('recu','lavage','repassage','emballage','pret','retire','annule')
+,`date_promise` date
+,`nom` varchar(120)
+,`prenom` varchar(120)
+,`telephone` varchar(30)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Stand-in structure for view `vue_commandes_solde`
+-- (See below for the actual view)
+--
+CREATE TABLE `vue_commandes_solde` (
+`id` int(11)
+,`reference` varchar(30)
+,`client_id` int(11)
+,`statut` enum('recu','lavage','repassage','emballage','pret','retire','annule')
+,`total` decimal(12,2)
+,`paye` decimal(35,2)
+,`reste_a_payer` decimal(36,2)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Stand-in structure for view `vue_fournisseurs_solde`
+-- (See below for the actual view)
+--
+CREATE TABLE `vue_fournisseurs_solde` (
+`id` int(11)
+,`nom` varchar(150)
+,`solde_du` decimal(47,5)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Stand-in structure for view `vue_marge_commandes`
+-- (See below for the actual view)
+--
+CREATE TABLE `vue_marge_commandes` (
+`commande_id` int(11)
+,`ventes` decimal(34,2)
+,`couts_estimes` decimal(44,2)
+,`marge_brute` decimal(45,2)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Stand-in structure for view `vue_stock_etat`
+-- (See below for the actual view)
+--
+CREATE TABLE `vue_stock_etat` (
+`id` int(11)
+,`libelle` varchar(150)
+,`categorie` enum('consommable','emballage','outillage','autre')
+,`unite` enum('kg','litre','paquet','piece','bidon')
+,`quantite_stock` decimal(12,3)
+,`seuil_min` decimal(12,3)
+,`cout_moyen` decimal(12,2)
+,`valeur_stock` decimal(24,5)
+,`a_reapprovisionner` int(1)
+);
+
+-- --------------------------------------------------------
+
+--
+-- Stand-in structure for view `vue_tableau_bord`
+-- (See below for the actual view)
+--
+CREATE TABLE `vue_tableau_bord` (
+`clients_total` bigint(21)
+,`commandes_en_cours` bigint(21)
+,`commandes_pretes` bigint(21)
+,`commandes_en_retard` bigint(21)
+,`encaissements_mois` decimal(34,2)
+,`depenses_mois` decimal(34,2)
+,`alertes_stock_ouvertes` bigint(21)
+);
+
+--
+-- Indexes for dumped tables
+--
+
+--
+-- Indexes for table `alertes_stock`
+--
+ALTER TABLE `alertes_stock`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `produit_id` (`produit_id`),
+  ADD KEY `traitee_par` (`traitee_par`);
+
+--
+-- Indexes for table `appareils`
+--
+ALTER TABLE `appareils`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`);
+
+--
+-- Indexes for table `avis_clients`
+--
+ALTER TABLE `avis_clients`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_avis_client_commande` (`client_id`,`commande_id`),
+  ADD KEY `idx_avis_date` (`cree_le`),
+  ADD KEY `fk_avis_commande` (`commande_id`);
+
+--
+-- Indexes for table `bons_achat`
+--
+ALTER TABLE `bons_achat`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `reference` (`reference`),
+  ADD KEY `fournisseur_id` (`fournisseur_id`),
+  ADD KEY `cree_par` (`cree_par`);
+
+--
+-- Indexes for table `bons_achat_lignes`
+--
+ALTER TABLE `bons_achat_lignes`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `bon_id` (`bon_id`),
+  ADD KEY `produit_id` (`produit_id`);
+
+--
+-- Indexes for table `clients`
+--
+ALTER TABLE `clients`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `utilisateur_id` (`utilisateur_id`),
+  ADD KEY `idx_client_tel` (`telephone`),
+  ADD KEY `idx_client_nom` (`nom`,`prenom`),
+  ADD KEY `cree_par` (`cree_par`);
+
+--
+-- Indexes for table `commandes`
+--
+ALTER TABLE `commandes`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `reference` (`reference`),
+  ADD KEY `idx_cmd_statut` (`statut`),
+  ADD KEY `idx_cmd_date` (`date_depot`),
+  ADD KEY `client_id` (`client_id`),
+  ADD KEY `depose_par` (`depose_par`);
+
+--
+-- Indexes for table `commande_lignes`
+--
+ALTER TABLE `commande_lignes`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `commande_id` (`commande_id`),
+  ADD KEY `tarif_id` (`tarif_id`);
+
+--
+-- Indexes for table `communications`
+--
+ALTER TABLE `communications`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `client_id` (`client_id`),
+  ADD KEY `commande_id` (`commande_id`),
+  ADD KEY `cree_par` (`cree_par`);
+
+--
+-- Indexes for table `courses`
+--
+ALTER TABLE `courses`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `commande_id` (`commande_id`),
+  ADD KEY `livreur_id` (`livreur_id`);
+
+--
+-- Indexes for table `demandes_clients`
+--
+ALTER TABLE `demandes_clients`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_demandes_client_date` (`client_id`,`date_prevue`),
+  ADD KEY `idx_demandes_statut_date` (`statut`,`date_prevue`),
+  ADD KEY `fk_demandes_traite_par` (`traite_par`);
+
+--
+-- Indexes for table `depenses`
+--
+ALTER TABLE `depenses`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `fournisseur_id` (`fournisseur_id`),
+  ADD KEY `intervention_id` (`intervention_id`),
+  ADD KEY `session_id` (`session_id`),
+  ADD KEY `enregistre_par` (`enregistre_par`);
+
+--
+-- Indexes for table `employes`
+--
+ALTER TABLE `employes`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `utilisateur_id` (`utilisateur_id`);
+
+--
+-- Indexes for table `equipements`
+--
+ALTER TABLE `equipements`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `fournisseur_id` (`fournisseur_id`);
+
+--
+-- Indexes for table `file_synchro`
+--
+ALTER TABLE `file_synchro`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `idx_sync_statut` (`statut`);
+
+--
+-- Indexes for table `fournisseurs`
+--
+ALTER TABLE `fournisseurs`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`);
+
+--
+-- Indexes for table `historique_statuts`
+--
+ALTER TABLE `historique_statuts`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `commande_id` (`commande_id`),
+  ADD KEY `utilisateur_id` (`utilisateur_id`);
+
+--
+-- Indexes for table `interventions`
+--
+ALTER TABLE `interventions`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `equipement_id` (`equipement_id`);
+
+--
+-- Indexes for table `journal_audit`
+--
+ALTER TABLE `journal_audit`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `utilisateur_id` (`utilisateur_id`);
+
+--
+-- Indexes for table `mouvements_stock`
+--
+ALTER TABLE `mouvements_stock`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `produit_id` (`produit_id`),
+  ADD KEY `utilisateur_id` (`utilisateur_id`);
+
+--
+-- Indexes for table `paiements`
+--
+ALTER TABLE `paiements`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `idx_paie_commande` (`commande_id`),
+  ADD KEY `session_id` (`session_id`),
+  ADD KEY `enregistre_par` (`enregistre_par`);
+
+--
+-- Indexes for table `parametres`
+--
+ALTER TABLE `parametres`
+  ADD PRIMARY KEY (`cle`);
+
+--
+-- Indexes for table `presences`
+--
+ALTER TABLE `presences`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_presence` (`employe_id`,`date_presence`);
+
+--
+-- Indexes for table `produits_stock`
+--
+ALTER TABLE `produits_stock`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `reference` (`reference`);
+
+--
+-- Indexes for table `reclamations`
+--
+ALTER TABLE `reclamations`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `client_id` (`client_id`),
+  ADD KEY `commande_id` (`commande_id`),
+  ADD KEY `traite_par` (`traite_par`);
+
+--
+-- Indexes for table `reglements_fournisseurs`
+--
+ALTER TABLE `reglements_fournisseurs`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `fournisseur_id` (`fournisseur_id`),
+  ADD KEY `bon_id` (`bon_id`),
+  ADD KEY `session_id` (`session_id`),
+  ADD KEY `enregistre_par` (`enregistre_par`);
+
+--
+-- Indexes for table `remboursements`
+--
+ALTER TABLE `remboursements`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `commande_id` (`commande_id`),
+  ADD KEY `session_id` (`session_id`),
+  ADD KEY `enregistre_par` (`enregistre_par`);
+
+--
+-- Indexes for table `salaires`
+--
+ALTER TABLE `salaires`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `employe_id` (`employe_id`),
+  ADD KEY `enregistre_par` (`enregistre_par`),
+  ADD KEY `fk_salaire_session` (`session_id`);
+
+--
+-- Indexes for table `services`
+--
+ALTER TABLE `services`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `code` (`code`);
+
+--
+-- Indexes for table `sessions_caisse`
+--
+ALTER TABLE `sessions_caisse`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD KEY `utilisateur_id` (`utilisateur_id`),
+  ADD KEY `valide_par` (`valide_par`);
+
+--
+-- Indexes for table `tarifs`
+--
+ALTER TABLE `tarifs`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `uq_tarif` (`service_id`,`type_article_id`,`date_effet`),
+  ADD KEY `type_article_id` (`type_article_id`);
+
+--
+-- Indexes for table `types_articles`
+--
+ALTER TABLE `types_articles`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `nom` (`nom`);
+
+--
+-- Indexes for table `utilisateurs`
+--
+ALTER TABLE `utilisateurs`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uuid` (`uuid`),
+  ADD UNIQUE KEY `email` (`email`);
+
+--
+-- AUTO_INCREMENT for dumped tables
+--
+
+--
+-- AUTO_INCREMENT for table `alertes_stock`
+--
+ALTER TABLE `alertes_stock`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=6;
+
+--
+-- AUTO_INCREMENT for table `appareils`
+--
+ALTER TABLE `appareils`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `avis_clients`
+--
+ALTER TABLE `avis_clients`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `bons_achat`
+--
+ALTER TABLE `bons_achat`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3;
+
+--
+-- AUTO_INCREMENT for table `bons_achat_lignes`
+--
+ALTER TABLE `bons_achat_lignes`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `clients`
+--
+ALTER TABLE `clients`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `commandes`
+--
+ALTER TABLE `commandes`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `commande_lignes`
+--
+ALTER TABLE `commande_lignes`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `communications`
+--
+ALTER TABLE `communications`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=9;
+
+--
+-- AUTO_INCREMENT for table `courses`
+--
+ALTER TABLE `courses`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `demandes_clients`
+--
+ALTER TABLE `demandes_clients`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `depenses`
+--
+ALTER TABLE `depenses`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `employes`
+--
+ALTER TABLE `employes`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `equipements`
+--
+ALTER TABLE `equipements`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `file_synchro`
+--
+ALTER TABLE `file_synchro`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `fournisseurs`
+--
+ALTER TABLE `fournisseurs`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
+
+--
+-- AUTO_INCREMENT for table `historique_statuts`
+--
+ALTER TABLE `historique_statuts`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=21;
+
+--
+-- AUTO_INCREMENT for table `interventions`
+--
+ALTER TABLE `interventions`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `journal_audit`
+--
+ALTER TABLE `journal_audit`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=33;
+
+--
+-- AUTO_INCREMENT for table `mouvements_stock`
+--
+ALTER TABLE `mouvements_stock`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `paiements`
+--
+ALTER TABLE `paiements`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `presences`
+--
+ALTER TABLE `presences`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=12;
+
+--
+-- AUTO_INCREMENT for table `produits_stock`
+--
+ALTER TABLE `produits_stock`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `reclamations`
+--
+ALTER TABLE `reclamations`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `reglements_fournisseurs`
+--
+ALTER TABLE `reglements_fournisseurs`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `remboursements`
+--
+ALTER TABLE `remboursements`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `salaires`
+--
+ALTER TABLE `salaires`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `services`
+--
+ALTER TABLE `services`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `sessions_caisse`
+--
+ALTER TABLE `sessions_caisse`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `tarifs`
+--
+ALTER TABLE `tarifs`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `types_articles`
+--
+ALTER TABLE `types_articles`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=8;
+
+--
+-- AUTO_INCREMENT for table `utilisateurs`
+--
+ALTER TABLE `utilisateurs`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=35;
+
+-- --------------------------------------------------------
+
+--
+-- Structure for view `vue_commandes_en_retard`
+--
+DROP TABLE IF EXISTS `vue_commandes_en_retard`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vue_commandes_en_retard`  AS SELECT `c`.`id` AS `id`, `c`.`reference` AS `reference`, `c`.`statut` AS `statut`, `c`.`date_promise` AS `date_promise`, `cl`.`nom` AS `nom`, `cl`.`prenom` AS `prenom`, `cl`.`telephone` AS `telephone` FROM (`commandes` `c` join `clients` `cl` on(`cl`.`id` = `c`.`client_id`)) WHERE `c`.`statut` not in ('retire','annule') AND `c`.`date_promise` < curdate() ;
+
+-- --------------------------------------------------------
+
+--
+-- Structure for view `vue_commandes_solde`
+--
+DROP TABLE IF EXISTS `vue_commandes_solde`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vue_commandes_solde`  AS SELECT `c`.`id` AS `id`, `c`.`reference` AS `reference`, `c`.`client_id` AS `client_id`, `c`.`statut` AS `statut`, `c`.`total` AS `total`, coalesce(`p`.`encaisse`,0) - coalesce(`r`.`rembourse`,0) AS `paye`, `c`.`total`- (coalesce(`p`.`encaisse`,0) - coalesce(`r`.`rembourse`,0)) AS `reste_a_payer` FROM ((`commandes` `c` left join (select `paiements`.`commande_id` AS `commande_id`,sum(`paiements`.`montant`) AS `encaisse` from `paiements` group by `paiements`.`commande_id`) `p` on(`p`.`commande_id` = `c`.`id`)) left join (select `remboursements`.`commande_id` AS `commande_id`,sum(`remboursements`.`montant`) AS `rembourse` from `remboursements` group by `remboursements`.`commande_id`) `r` on(`r`.`commande_id` = `c`.`id`)) ;
+
+-- --------------------------------------------------------
+
+--
+-- Structure for view `vue_fournisseurs_solde`
+--
+DROP TABLE IF EXISTS `vue_fournisseurs_solde`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vue_fournisseurs_solde`  AS SELECT `f`.`id` AS `id`, `f`.`nom` AS `nom`, coalesce((select sum(`bl`.`quantite_recue` * `bl`.`prix_unitaire`) from (`bons_achat_lignes` `bl` join `bons_achat` `b` on(`b`.`id` = `bl`.`bon_id`)) where `b`.`fournisseur_id` = `f`.`id`),0) - coalesce((select sum(`r`.`montant`) from `reglements_fournisseurs` `r` where `r`.`fournisseur_id` = `f`.`id`),0) AS `solde_du` FROM `fournisseurs` AS `f` ;
+
+-- --------------------------------------------------------
+
+--
+-- Structure for view `vue_marge_commandes`
+--
+DROP TABLE IF EXISTS `vue_marge_commandes`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vue_marge_commandes`  AS SELECT `l`.`commande_id` AS `commande_id`, sum(`l`.`sous_total`) AS `ventes`, sum(`l`.`quantite` * `l`.`cout_unitaire`) AS `couts_estimes`, sum(`l`.`sous_total`) - sum(`l`.`quantite` * `l`.`cout_unitaire`) AS `marge_brute` FROM `commande_lignes` AS `l` GROUP BY `l`.`commande_id` ;
+
+-- --------------------------------------------------------
+
+--
+-- Structure for view `vue_stock_etat`
+--
+DROP TABLE IF EXISTS `vue_stock_etat`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vue_stock_etat`  AS SELECT `p`.`id` AS `id`, `p`.`libelle` AS `libelle`, `p`.`categorie` AS `categorie`, `p`.`unite` AS `unite`, `p`.`quantite_stock` AS `quantite_stock`, `p`.`seuil_min` AS `seuil_min`, `p`.`cout_moyen` AS `cout_moyen`, `p`.`quantite_stock`* `p`.`cout_moyen` AS `valeur_stock`, `p`.`quantite_stock`<= `p`.`seuil_min` AS `a_reapprovisionner` FROM `produits_stock` AS `p` WHERE `p`.`actif` = 1 ;
+
+-- --------------------------------------------------------
+
+--
+-- Structure for view `vue_tableau_bord`
+--
+DROP TABLE IF EXISTS `vue_tableau_bord`;
+
+CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `vue_tableau_bord`  AS SELECT (select count(0) from `clients` where `clients`.`supprime` = 0) AS `clients_total`, (select count(0) from `commandes` where `commandes`.`statut` not in ('retire','annule')) AS `commandes_en_cours`, (select count(0) from `commandes` where `commandes`.`statut` = 'pret') AS `commandes_pretes`, (select count(0) from `vue_commandes_en_retard`) AS `commandes_en_retard`, (select coalesce(sum(`paiements`.`montant`),0) from `paiements` where year(`paiements`.`date_paiement`) = year(curdate()) and month(`paiements`.`date_paiement`) = month(curdate())) AS `encaissements_mois`, (select coalesce(sum(`depenses`.`montant`),0) from `depenses` where year(`depenses`.`date_depense`) = year(curdate()) and month(`depenses`.`date_depense`) = month(curdate())) AS `depenses_mois`, (select count(0) from `alertes_stock` where `alertes_stock`.`etat` = 'ouverte') AS `alertes_stock_ouvertes` ;
+
+--
+-- Constraints for dumped tables
+--
+
+--
+-- Constraints for table `alertes_stock`
+--
+ALTER TABLE `alertes_stock`
+  ADD CONSTRAINT `alertes_stock_ibfk_1` FOREIGN KEY (`produit_id`) REFERENCES `produits_stock` (`id`),
+  ADD CONSTRAINT `alertes_stock_ibfk_2` FOREIGN KEY (`traitee_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `avis_clients`
+--
+ALTER TABLE `avis_clients`
+  ADD CONSTRAINT `fk_avis_client` FOREIGN KEY (`client_id`) REFERENCES `clients` (`id`),
+  ADD CONSTRAINT `fk_avis_commande` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`);
+
+--
+-- Constraints for table `bons_achat`
+--
+ALTER TABLE `bons_achat`
+  ADD CONSTRAINT `bons_achat_ibfk_1` FOREIGN KEY (`fournisseur_id`) REFERENCES `fournisseurs` (`id`),
+  ADD CONSTRAINT `bons_achat_ibfk_2` FOREIGN KEY (`cree_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `bons_achat_lignes`
+--
+ALTER TABLE `bons_achat_lignes`
+  ADD CONSTRAINT `bons_achat_lignes_ibfk_1` FOREIGN KEY (`bon_id`) REFERENCES `bons_achat` (`id`),
+  ADD CONSTRAINT `bons_achat_lignes_ibfk_2` FOREIGN KEY (`produit_id`) REFERENCES `produits_stock` (`id`);
+
+--
+-- Constraints for table `clients`
+--
+ALTER TABLE `clients`
+  ADD CONSTRAINT `clients_ibfk_1` FOREIGN KEY (`cree_par`) REFERENCES `utilisateurs` (`id`),
+  ADD CONSTRAINT `fk_clients_utilisateur` FOREIGN KEY (`utilisateur_id`) REFERENCES `utilisateurs` (`id`) ON DELETE SET NULL;
+
+--
+-- Constraints for table `commandes`
+--
+ALTER TABLE `commandes`
+  ADD CONSTRAINT `commandes_ibfk_1` FOREIGN KEY (`client_id`) REFERENCES `clients` (`id`),
+  ADD CONSTRAINT `commandes_ibfk_2` FOREIGN KEY (`depose_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `commande_lignes`
+--
+ALTER TABLE `commande_lignes`
+  ADD CONSTRAINT `commande_lignes_ibfk_1` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`),
+  ADD CONSTRAINT `commande_lignes_ibfk_2` FOREIGN KEY (`tarif_id`) REFERENCES `tarifs` (`id`);
+
+--
+-- Constraints for table `communications`
+--
+ALTER TABLE `communications`
+  ADD CONSTRAINT `communications_ibfk_1` FOREIGN KEY (`client_id`) REFERENCES `clients` (`id`),
+  ADD CONSTRAINT `communications_ibfk_2` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`),
+  ADD CONSTRAINT `communications_ibfk_3` FOREIGN KEY (`cree_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `courses`
+--
+ALTER TABLE `courses`
+  ADD CONSTRAINT `courses_ibfk_1` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`),
+  ADD CONSTRAINT `courses_ibfk_2` FOREIGN KEY (`livreur_id`) REFERENCES `employes` (`id`);
+
+--
+-- Constraints for table `demandes_clients`
+--
+ALTER TABLE `demandes_clients`
+  ADD CONSTRAINT `fk_demandes_client` FOREIGN KEY (`client_id`) REFERENCES `clients` (`id`),
+  ADD CONSTRAINT `fk_demandes_traite_par` FOREIGN KEY (`traite_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `depenses`
+--
+ALTER TABLE `depenses`
+  ADD CONSTRAINT `depenses_ibfk_1` FOREIGN KEY (`fournisseur_id`) REFERENCES `fournisseurs` (`id`),
+  ADD CONSTRAINT `depenses_ibfk_2` FOREIGN KEY (`intervention_id`) REFERENCES `interventions` (`id`),
+  ADD CONSTRAINT `depenses_ibfk_3` FOREIGN KEY (`session_id`) REFERENCES `sessions_caisse` (`id`),
+  ADD CONSTRAINT `depenses_ibfk_4` FOREIGN KEY (`enregistre_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `employes`
+--
+ALTER TABLE `employes`
+  ADD CONSTRAINT `employes_ibfk_1` FOREIGN KEY (`utilisateur_id`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `equipements`
+--
+ALTER TABLE `equipements`
+  ADD CONSTRAINT `equipements_ibfk_1` FOREIGN KEY (`fournisseur_id`) REFERENCES `fournisseurs` (`id`);
+
+--
+-- Constraints for table `historique_statuts`
+--
+ALTER TABLE `historique_statuts`
+  ADD CONSTRAINT `historique_statuts_ibfk_1` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`),
+  ADD CONSTRAINT `historique_statuts_ibfk_2` FOREIGN KEY (`utilisateur_id`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `interventions`
+--
+ALTER TABLE `interventions`
+  ADD CONSTRAINT `interventions_ibfk_1` FOREIGN KEY (`equipement_id`) REFERENCES `equipements` (`id`);
+
+--
+-- Constraints for table `journal_audit`
+--
+ALTER TABLE `journal_audit`
+  ADD CONSTRAINT `journal_audit_ibfk_1` FOREIGN KEY (`utilisateur_id`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `mouvements_stock`
+--
+ALTER TABLE `mouvements_stock`
+  ADD CONSTRAINT `mouvements_stock_ibfk_1` FOREIGN KEY (`produit_id`) REFERENCES `produits_stock` (`id`),
+  ADD CONSTRAINT `mouvements_stock_ibfk_2` FOREIGN KEY (`utilisateur_id`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `paiements`
+--
+ALTER TABLE `paiements`
+  ADD CONSTRAINT `paiements_ibfk_1` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`),
+  ADD CONSTRAINT `paiements_ibfk_2` FOREIGN KEY (`session_id`) REFERENCES `sessions_caisse` (`id`),
+  ADD CONSTRAINT `paiements_ibfk_3` FOREIGN KEY (`enregistre_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `presences`
+--
+ALTER TABLE `presences`
+  ADD CONSTRAINT `presences_ibfk_1` FOREIGN KEY (`employe_id`) REFERENCES `employes` (`id`);
+
+--
+-- Constraints for table `reclamations`
+--
+ALTER TABLE `reclamations`
+  ADD CONSTRAINT `reclamations_ibfk_1` FOREIGN KEY (`client_id`) REFERENCES `clients` (`id`),
+  ADD CONSTRAINT `reclamations_ibfk_2` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`),
+  ADD CONSTRAINT `reclamations_ibfk_3` FOREIGN KEY (`traite_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `reglements_fournisseurs`
+--
+ALTER TABLE `reglements_fournisseurs`
+  ADD CONSTRAINT `reglements_fournisseurs_ibfk_1` FOREIGN KEY (`fournisseur_id`) REFERENCES `fournisseurs` (`id`),
+  ADD CONSTRAINT `reglements_fournisseurs_ibfk_2` FOREIGN KEY (`bon_id`) REFERENCES `bons_achat` (`id`),
+  ADD CONSTRAINT `reglements_fournisseurs_ibfk_3` FOREIGN KEY (`session_id`) REFERENCES `sessions_caisse` (`id`),
+  ADD CONSTRAINT `reglements_fournisseurs_ibfk_4` FOREIGN KEY (`enregistre_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `remboursements`
+--
+ALTER TABLE `remboursements`
+  ADD CONSTRAINT `remboursements_ibfk_1` FOREIGN KEY (`commande_id`) REFERENCES `commandes` (`id`),
+  ADD CONSTRAINT `remboursements_ibfk_2` FOREIGN KEY (`session_id`) REFERENCES `sessions_caisse` (`id`),
+  ADD CONSTRAINT `remboursements_ibfk_3` FOREIGN KEY (`enregistre_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `salaires`
+--
+ALTER TABLE `salaires`
+  ADD CONSTRAINT `fk_salaire_session` FOREIGN KEY (`session_id`) REFERENCES `sessions_caisse` (`id`),
+  ADD CONSTRAINT `salaires_ibfk_1` FOREIGN KEY (`employe_id`) REFERENCES `employes` (`id`),
+  ADD CONSTRAINT `salaires_ibfk_2` FOREIGN KEY (`enregistre_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `sessions_caisse`
+--
+ALTER TABLE `sessions_caisse`
+  ADD CONSTRAINT `sessions_caisse_ibfk_1` FOREIGN KEY (`utilisateur_id`) REFERENCES `utilisateurs` (`id`),
+  ADD CONSTRAINT `sessions_caisse_ibfk_2` FOREIGN KEY (`valide_par`) REFERENCES `utilisateurs` (`id`);
+
+--
+-- Constraints for table `tarifs`
+--
+ALTER TABLE `tarifs`
+  ADD CONSTRAINT `tarifs_ibfk_1` FOREIGN KEY (`service_id`) REFERENCES `services` (`id`),
+  ADD CONSTRAINT `tarifs_ibfk_2` FOREIGN KEY (`type_article_id`) REFERENCES `types_articles` (`id`);
+COMMIT;
+
+/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
+/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;

@@ -1,4 +1,20 @@
 Options -Indexes
+<FilesMatch "\.(sql|bak|env)$">
+  Require all denied
+</FilesMatch>
+<FilesMatch "^\.env">
+  Require all denied
+</FilesMatch>
 <FilesMatch "^(install\.sql|README_INSTALLATION\.txt)$">
   Require all denied
 </FilesMatch>
+<IfModule mod_headers.c>
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set X-Frame-Options "DENY"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set Permissions-Policy "camera=(), microphone=(), geolocation=(self)"
+</IfModule>
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^(archive|database|supabase|scripts)(/|$) - [F,L,NC]
+</IfModule>
