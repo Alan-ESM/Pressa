@@ -11,9 +11,11 @@ $language=$_SESSION['language']??'fr';
 <aside class="sidebar" id="appSidebar"><div class="brand"><img class="brand-logo" src="assets/img/Pressa%20Dragon%20Steam%20Emblem.png" alt="Pressa"><span class="brand-label"><?=e($appTitle)?></span></div><div class="userbox"><?=e($_SESSION['user']['name'])?><small><?=e(role_label(role()))?></small></div><nav>
 <?php if(role()==='livreur'): ?>
 <a href="livreur.php">▣ Mes livraisons</a>
+<?php elseif(role()==='responsable'): ?>
+<a href="users.php">⚙ Comptes autorisés</a>
 <?php elseif(role()==='admin'): ?>
 <a href="dashboard.php">▦ Tableau de bord</a><a href="clients.php">♙ Clients</a><a href="orders.php">▤ Commandes</a><a href="client_requests.php">⌖ Demandes clients</a><a href="production.php">◈ Production</a><a href="invoices.php">▧ Paiements</a><a href="messages.php">✉ Messages</a><a href="ratings.php">★ Évaluations</a><a href="users.php">⚙ Utilisateurs</a><a href="services.php">◆ Services & tarifs</a><a href="stock.php">▦ Stock</a><a href="suppliers.php">♧ Fournisseurs</a><a href="purchases.php">▤ Achats</a><a href="maintenance.php">⚒ Maintenance</a><a href="livreur.php">▣ Livraisons</a><a href="expenses.php">₣ Dépenses</a><a href="reports.php">▤ Rapports</a><a href="settings.php">⚙ Paramètres</a>
-<?php elseif(in_array(role(),['receptionniste','accueil'],true)): ?>
+<?php elseif(role()==='accueil'): ?>
 <a href="dashboard.php">▦ Tableau de bord</a><a href="clients.php">♙ Clients</a><a href="orders.php">▤ Commandes & dépôts</a><a href="client_requests.php">⌖ Demandes clients</a><a href="production.php">◈ Production</a><a href="invoices.php">▧ Factures & paiements</a><a href="messages.php">✉ Messages clients</a><a href="expenses.php">₣ Dépenses</a><a href="livreur.php">▣ Livraisons</a>
 <?php elseif(role()==='caissier'): ?>
 <a href="dashboard.php">▦ Tableau de bord</a><a href="orders.php">▤ Commandes</a><a href="invoices.php">▧ Factures & paiements</a>

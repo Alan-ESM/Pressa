@@ -1020,7 +1020,7 @@ CREATE TABLE `parametres` (
 INSERT INTO `parametres` (`cle`, `valeur`, `description`) VALUES
 ('adresse', 'Yaoundé, Cameroun', 'Adresse du pressing'),
 ('delai_defaut_jours', '2', 'Délai par défaut avant retrait prévu'),
-('devise', 'FCFA', 'Devise'),
+('devise', 'FCFA (XAF)', 'Devise'),
 ('fuseau_horaire', 'Africa/Douala', 'Fuseau horaire de l\'application'),
 ('nom_application', 'Pressa', 'Nom du logiciel (titres, icône, domaine)'),
 ('nom_pressing', 'Pressa', 'Nom affiché sur les reçus et les SMS'),
@@ -1397,8 +1397,9 @@ CREATE TABLE `utilisateurs` (
   `nom` varchar(120) NOT NULL,
   `email` varchar(160) NOT NULL,
   `mot_de_passe` varchar(255) NOT NULL,
-  `role` enum('admin','caissier','accueil','receptionniste','production','livreur','client') NOT NULL DEFAULT 'accueil',
+  `role` enum('admin','responsable','caissier','accueil','production','livreur','client') NOT NULL DEFAULT 'accueil',
   `actif` tinyint(1) NOT NULL DEFAULT 1,
+  `doit_changer_mdp` tinyint(1) NOT NULL DEFAULT 0,
   `tentatives_echec` int(11) NOT NULL DEFAULT 0,
   `verrouille_jusqu_a` datetime DEFAULT NULL,
   `derniere_connexion` datetime DEFAULT NULL,
@@ -1410,14 +1411,14 @@ CREATE TABLE `utilisateurs` (
 -- Dumping data for table `utilisateurs`
 --
 
-INSERT INTO `utilisateurs` (`id`, `uuid`, `nom`, `email`, `mot_de_passe`, `role`, `actif`, `tentatives_echec`, `verrouille_jusqu_a`, `derniere_connexion`, `cree_le`, `modifie_le`) VALUES
+INSERT INTO `utilisateurs` (`id`, `uuid`, `nom`, `email`, `mot_de_passe`, `role`, `actif`, `doit_changer_mdp`, `tentatives_echec`, `verrouille_jusqu_a`, `derniere_connexion`, `cree_le`, `modifie_le`) VALUES
 (1, '123', 'Administrateur', 'pressa.admin.initial@gmail.com', '$2y$10$QkRGTvXltDFwe6ghTKccOuhywtZkV0iDtoTw/rb4FlWIfR6BrEeK.', 'admin', 1, 0, NULL, '2026-11-19 22:00:20', '2026-11-19 00:34:59', '2026-11-19 22:00:20'),
-(29, 'a6576dad-e45b-11f1-b0c7-0c5415f01e22', 'Réceptionniste 67prime', '67prime.ess@gmail.com', '$2y$10$21IiLRWkdCoTDn3A7EG/6OfJLcuOrVBrNbuc4Oj8ylifAK.o092iu', 'receptionniste', 1, 0, NULL, '2026-11-19 22:13:27', '2026-11-19 21:56:10', '2026-11-19 22:13:27'),
-(30, 'a6612577-e45b-11f1-b0c7-0c5415f01e22', 'Daniel Accueil', 'Daniel@gmail.com', '$2y$10$zw2m55egIWe.eI9C30c05uNvABuf/PoL2ban36dC/bxj4u28utX0O', 'accueil', 1, 0, NULL, NULL, '2026-11-19 21:56:10', '2026-11-19 21:56:10'),
-(31, 'a66adddc-e45b-11f1-b0c7-0c5415f01e22', 'Jojo Mel', 'jojomel@gmail.com', '$2y$10$ry9k6FbSyXsg0LzAZJZfzOhCILQkfFQw9qPcYavJ2flpHlMo5pgdC', 'caissier', 1, 0, NULL, NULL, '2026-11-19 21:56:10', '2026-11-19 21:56:10'),
-(32, 'a6752742-e45b-11f1-b0c7-0c5415f01e22', 'Tafu Gw', 'tafugw@gmail.com', '$2y$10$zJzj/ESbKfrk4/lW2jcZrOTtk/MW1wim2.1EVSBxgWsVMQao58UL6', 'production', 1, 0, NULL, NULL, '2026-11-19 21:56:11', '2026-11-19 21:56:11'),
-(33, 'a67f269f-e45b-11f1-b0c7-0c5415f01e22', 'Cris', 'Cris@gmail.com', '$2y$10$JsITTun0Xedsn4.4FhZlmesJkO405lmSP1FWmU7c61VvKsVAo2sqe', 'livreur', 1, 0, NULL, '2026-11-19 22:01:57', '2026-11-19 21:56:11', '2026-11-19 22:01:57'),
-(34, 'a688e856-e45b-11f1-b0c7-0c5415f01e22', 'Valdeshack', 'Valdeshack@gmail.com', '$2y$10$Fjw6vGyP8YnQ1ppdnzawEuyl61Rpr3NYOWhcR2DdFryOTF1fIkogu', 'client', 1, 0, NULL, NULL, '2026-11-19 21:56:11', '2026-11-19 21:56:11');
+(29, 'a6576dad-e45b-11f1-b0c7-0c5415f01e22', 'Réceptionniste 67prime', '67prime.ess@gmail.com', '$2y$10$21IiLRWkdCoTDn3A7EG/6OfJLcuOrVBrNbuc4Oj8ylifAK.o092iu', 'accueil', 1, 0, 0, NULL, '2026-11-19 22:13:27', '2026-11-19 21:56:10', '2026-11-19 22:13:27'),
+(30, 'a6612577-e45b-11f1-b0c7-0c5415f01e22', 'Daniel Accueil', 'Daniel@gmail.com', '$2y$10$zw2m55egIWe.eI9C30c05uNvABuf/PoL2ban36dC/bxj4u28utX0O', 'accueil', 1, 0, 0, NULL, NULL, '2026-11-19 21:56:10', '2026-11-19 21:56:10'),
+(31, 'a66adddc-e45b-11f1-b0c7-0c5415f01e22', 'Jojo Mel', 'jojomel@gmail.com', '$2y$10$ry9k6FbSyXsg0LzAZJZfzOhCILQkfFQw9qPcYavJ2flpHlMo5pgdC', 'caissier', 1, 0, 0, NULL, NULL, '2026-11-19 21:56:10', '2026-11-19 21:56:10'),
+(32, 'a6752742-e45b-11f1-b0c7-0c5415f01e22', 'Tafu Gw', 'tafugw@gmail.com', '$2y$10$zJzj/ESbKfrk4/lW2jcZrOTtk/MW1wim2.1EVSBxgWsVMQao58UL6', 'production', 1, 0, 0, NULL, NULL, '2026-11-19 21:56:11', '2026-11-19 21:56:11'),
+(33, 'a67f269f-e45b-11f1-b0c7-0c5415f01e22', 'Cris', 'Cris@gmail.com', '$2y$10$JsITTun0Xedsn4.4FhZlmesJkO405lmSP1FWmU7c61VvKsVAo2sqe', 'livreur', 1, 0, 0, NULL, '2026-11-19 22:01:57', '2026-11-19 21:56:11', '2026-11-19 22:01:57'),
+(34, 'a688e856-e45b-11f1-b0c7-0c5415f01e22', 'Valdeshack', 'Valdeshack@gmail.com', '$2y$10$Fjw6vGyP8YnQ1ppdnzawEuyl61Rpr3NYOWhcR2DdFryOTF1fIkogu', 'client', 1, 0, 0, NULL, NULL, '2026-11-19 21:56:11', '2026-11-19 21:56:11');
 
 --
 -- Triggers `utilisateurs`
@@ -1439,6 +1440,26 @@ DELIMITER ;
 -- --------------------------------------------------------
 
 --
+CREATE TABLE `limites_inscription` (
+  `cle_ip` char(64) NOT NULL,
+  `debut_fenetre` datetime NOT NULL,
+  `tentatives` int(11) NOT NULL DEFAULT 0,
+  PRIMARY KEY (`cle_ip`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `gestion_comptes_audit` (
+  `id` bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+  `auteur_id` int(11) NOT NULL,
+  `cible_id` int(11) DEFAULT NULL,
+  `cible_email` varchar(160) NOT NULL,
+  `action` varchar(30) NOT NULL,
+  `motif` varchar(500) NOT NULL,
+  `date_action` datetime NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  KEY `idx_gestion_comptes_cible` (`cible_id`),
+  KEY `idx_gestion_comptes_auteur` (`auteur_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- Stand-in structure for view `vue_commandes_en_retard`
 -- (See below for the actual view)
 --
@@ -2254,6 +2275,10 @@ ALTER TABLE `sessions_caisse`
 ALTER TABLE `tarifs`
   ADD CONSTRAINT `tarifs_ibfk_1` FOREIGN KEY (`service_id`) REFERENCES `services` (`id`),
   ADD CONSTRAINT `tarifs_ibfk_2` FOREIGN KEY (`type_article_id`) REFERENCES `types_articles` (`id`);
+
+ALTER TABLE `gestion_comptes_audit`
+  ADD CONSTRAINT `fk_gestion_comptes_auteur` FOREIGN KEY (`auteur_id`) REFERENCES `utilisateurs` (`id`),
+  ADD CONSTRAINT `fk_gestion_comptes_cible` FOREIGN KEY (`cible_id`) REFERENCES `utilisateurs` (`id`) ON DELETE SET NULL;
 COMMIT;
 
 /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;

@@ -19,7 +19,7 @@ if (!defined('DB_PORT')) define('DB_PORT', (int)(getenv('PRESSA_DB_PORT') ?: 543
 if (!defined('APP_NAME')) define('APP_NAME', 'Pressa');
 if (!defined('APP_URL')) define('APP_URL', '/Pressa');
 if (!defined('EXPRESS_SURCHARGE_PERCENT')) define('EXPRESS_SURCHARGE_PERCENT', 30);
-if (!defined('CURRENCY_LABEL')) define('CURRENCY_LABEL', 'FCFA');
+if (!defined('CURRENCY_LABEL')) define('CURRENCY_LABEL', 'FCFA (XAF)');
 // Configure PRESSA_SMTP_PASSWORD as a Google App Password in .env or the server environment.
 if (!defined('SMTP_HOST')) define('SMTP_HOST', getenv('PRESSA_SMTP_HOST') ?: 'smtp.gmail.com');
 if (!defined('SMTP_PORT')) define('SMTP_PORT', (int)(getenv('PRESSA_SMTP_PORT') ?: 587));

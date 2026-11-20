@@ -1,0 +1,11 @@
+Sauvegarde préalable : C:\xampp\backups\pressa-before-roles-20261120-003807.sql
+
+Restauration complète sur la base pressa (remplace les données actuelles) :
+1. Arrêter Apache dans XAMPP pour couper les écritures.
+2. Sauvegarder d’abord l’état actuel :
+   C:\xampp\mysql\bin\mysqldump.exe -u root --single-transaction --routines --triggers --events --databases pressa > C:\xampp\backups\pressa-before-restore.sql
+3. Restaurer le dump :
+   C:\xampp\mysql\bin\mysql.exe -u root < C:\xampp\backups\pressa-before-roles-20261120-003807.sql
+4. Redémarrer Apache et vérifier l’application.
+
+La restauration réécrit les tables de pressa et revient à l’état du dump. Ne pas l’exécuter sans vérifier le fichier de sauvegarde et arrêter les écritures.

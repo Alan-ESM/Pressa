@@ -151,6 +151,15 @@ table{min-width:640px}
 .admin-shell .topbar{padding:0 0 18px;border-bottom:1px solid #27314a}
 .admin-shell .stat,.admin-shell .panel,.admin-shell .form-card{background:linear-gradient(145deg,#1a2238,#171d30);border-color:#2a3550;box-shadow:0 16px 36px #03071240;color:#e8ecf7}
 .admin-shell .stat .ico{background:#283655;color:#a9c1ff}
+.stat .ico.icon-clients{background:#dff7f1;color:#0b8271}
+.stat .ico.icon-orders{background:#edf2ff;color:#3157d5}
+.stat .ico.icon-ready{background:#dcfce7;color:#16834b}
+.stat .ico.icon-currency{background:#fff4d8;color:#a56a00}
+html[data-theme="dark"] .admin-shell .stat .ico{background:#283655;color:#a9c1ff}
+html[data-theme="dark"] .stat .ico.icon-clients{background:#123b3a;color:#55e1c2}
+html[data-theme="dark"] .stat .ico.icon-orders{background:#283655;color:#a9c1ff}
+html[data-theme="dark"] .stat .ico.icon-ready{background:#123827;color:#9ee6b8}
+html[data-theme="dark"] .stat .ico.icon-currency{background:#46371a;color:#f5d98e}
 .admin-shell th{background:#202a42;color:#aab6d1}
 .admin-shell td,.admin-shell th{border-color:#2a3550}
 .admin-shell input,.admin-shell select,.admin-shell textarea{background:#12192a;border-color:#34415d;color:#edf2ff}
